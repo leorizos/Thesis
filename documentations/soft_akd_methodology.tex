@@ -1,0 +1,291 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{tcolorbox}
+\usepackage{parskip}
+\tcbuselibrary{skins}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Sig}{\boldsymbol{\Sigma}}
+\newcommand{\sighat}{\hat{\boldsymbol{\Sigma}}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\T}{{\top}}
+
+\newtcolorbox{eq}[1][]{
+    enhanced, sharp corners,
+    colback=gray!8, colframe=black!30,
+    boxrule=0.6pt, left=6pt, right=6pt, top=4pt, bottom=4pt,
+    fontupper=\small, #1
+}
+
+\title{\textbf{Soft Anchor-based Knowledge Distillation}\\[0.2em]
+\normalsize Methodology Summary}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\vspace{-1em}
+
+% -------------------------------------------------------
+\section*{1\quad Anchor-based Knowledge Distillation (AKD)}
+% -------------------------------------------------------
+
+\textbf{Anchors.} One representative image per class is selected from the
+training set as the sample with highest cosine centrality among its
+class peers (i.e.\ highest average cosine similarity to all other samples
+of the same class). This gives an anchor set $\mathcal{A}$ of $C=100$ images.
+A learnable per-anchor spatial attention map $\mathbf{W}_c$ (energy-normalised
+at each step) is applied to the anchor before feeding it to the student
+network (\emph{AnchorNet}).
+
+\textbf{Similarity matrices.} Let $\mathbf{T},\mathbf{S}\in\R^{B\times D}$
+be $\ell_2$-normalised teacher/student batch features and
+$\mathbf{T}_A,\mathbf{S}_A\in\R^{A\times D}$ the corresponding anchor features.
+Cosine similarity is scaled to $[0,1]$ via $s(\mathbf{u},\mathbf{v})=(\mathbf{u}^\T\mathbf{v}+1)/2$.
+Three teacher/student matrix pairs are formed:
+\[
+    \mathbf{P}^{BB} = \frac{\mathbf{T}\mathbf{T}^\T+\mathbf{1}}{2}\in\R^{B\times B},
+    \quad
+    \mathbf{P}^{BA} = \frac{\mathbf{T}\mathbf{T}_A^\T+\mathbf{1}}{2}\in\R^{B\times A},
+    \quad
+    \mathbf{P}^{AB} = \bigl(\mathbf{P}^{BA}\bigr)^\T\in\R^{A\times B}.
+\]
+Each is row-normalised to a probability distribution
+$\tilde{\mathbf{P}}_{i\cdot} = \mathbf{P}_{i\cdot}/\sum_j P_{ij}$.
+
+\textbf{Loss.}
+\begin{eq}
+\[
+    \mathcal{L}_k = \sum_i \KL\!\left(\tilde{P}^k_{T,i\cdot}\;\|\;\tilde{P}^k_{S,i\cdot}\right),
+    \quad k\in\{BB,\,BA,\,AB\}
+    \qquad
+    \mathcal{L}_{\text{AKD}} = \ell_1\,\mathcal{L}_{BB}
+    + (1-\ell_2)\,\mathcal{L}_{BA}
+    + \ell_2\,\mathcal{L}_{AB}
+\]
+\end{eq}
+Total objective: $\mathcal{L} = \mathcal{L}_{\text{CE}} + \beta\,\mathcal{L}_{\text{AKD}}$.
+
+% -------------------------------------------------------
+\section*{2\quad Class Similarity Matrix $\Sig$}
+% -------------------------------------------------------
+
+A global $C\times C$ semantic prior is computed \emph{once} from the frozen
+teacher over the full training set:
+\[
+    \Sig_{ij} = \frac{1}{|\mathcal{F}_i||\mathcal{F}_j|}
+    \sum_{\mathbf{u}\in\mathcal{F}_i}\sum_{\mathbf{v}\in\mathcal{F}_j}
+    \frac{\mathbf{u}^\T\mathbf{v}+1}{2},
+\]
+where $\mathcal{F}_c$ is the set of $\ell_2$-normalised teacher features for class $c$.
+$\Sig$ is symmetric and reflects the teacher's inter-class similarity structure.
+
+\textbf{Temperature sharpening} ($\tau < 1$ increases contrast):
+\[
+    \Sig^{(\tau)}_{ij} = \Sig_{ij}^{1/\tau}.
+\]
+
+% -------------------------------------------------------
+\section*{3\quad SoftAKD: Blending Instance and Class-level Knowledge}
+% -------------------------------------------------------
+
+For the current batch/anchor labels $\mathbf{y}, \mathbf{y}_A$, we extract
+label-indexed subsets of $\Sig^{(\tau)}$:
+$\;\Sig_{BB}=\Sig^{(\tau)}[\mathbf{y},\mathbf{y}]$,\;
+$\Sig_{BA}=\Sig^{(\tau)}[\mathbf{y},\mathbf{y}_A]$,\;
+$\Sig_{AB}=\Sig^{(\tau)}[\mathbf{y}_A,\mathbf{y}]$.
+
+Then each teacher similarity matrix is softened before the KL computation.
+
+\subsection*{3a\quad Static $\lambda$ (baseline)}
+
+A single scalar $\lambda\in[0,1]$ blends all rows uniformly:
+\begin{eq}
+\[
+    \mathbf{P}^{k,\text{soft}}_{T}
+    = \lambda\,\mathbf{P}^k_{T} + (1-\lambda)\,\Sig_k,
+    \qquad k\in\{BB,\,BA,\,AB\}.
+\]
+\end{eq}
+At $\lambda=1$ this reduces to standard AKD; at $\lambda=0.9$ (used in experiments)
+10\% of the class-level structure is injected into every sample equally.
+
+\subsection*{3b\quad Adaptive $\lambda$ via Sigmoid Gate}
+
+The scalar $\lambda$ cannot distinguish easy samples (student already agrees
+with teacher) from hard ones. We replace it with a \emph{per-row} weight
+that increases class-level blending only when the student's distribution
+disagrees with the teacher.
+
+\textbf{Step 1 — Pearson distance} between row $i$ of the teacher and
+student similarity matrices:
+\begin{eq}
+\[
+    d_i = 1 - \frac{(\mathbf{p}_i^T - \bar{p}_i)^\T(\mathbf{p}_i^S - \bar{p}_i^S)}
+    {\|\mathbf{p}_i^T-\bar{p}_i^T\|_2\,\|\mathbf{p}_i^S-\bar{p}_i^S\|_2}
+    \;\in[0,2].
+\]
+\end{eq}
+Mean-centring removes absolute level effects; $d_i$ measures shape disagreement.
+
+\textbf{Step 2 — Normalise and apply sigmoid gate:}
+\begin{eq}
+\[
+    \tilde{d}_i = \frac{d_i}{\max_j d_j},
+    \qquad
+    g_i = \sigma\!\left(k\,(\tilde{d}_i - d_0)\right),
+    \qquad
+    \lambda_i = 1 - g_i\,(1-\lambda_{\min})
+    \;\in[\lambda_{\min},\,1].
+\]
+\end{eq}
+
+\textbf{Step 3 — Per-row blending} (applied independently to each of $BB$, $BA$, $AB$):
+\begin{eq}
+\[
+    \mathbf{P}^{k,\text{soft}}_{T,i\cdot}
+    = \lambda_i^k\,\mathbf{P}^k_{T,i\cdot}
+    + (1-\lambda_i^k)\,\Sig_{k,i\cdot}.
+\]
+\end{eq}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+ & Static ($\lambda=0.9$) & Adaptive \\
+\midrule
+Granularity & Same for all samples & Per sample, per term, per step \\
+Range & Fixed scalar & $[\lambda_{\min},\,1.0]$ per row \\
+Responds to disagreement & No & Yes \\
+Extra hyperparameters & None & $\lambda_{\min}=0.7$,\; $k=10$,\; $d_0=0.3$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -------------------------------------------------------
+\section*{4\quad CASL: Class-Adaptive Softening of Labels \cite{spanos}}
+% -------------------------------------------------------
+
+CASL addresses class uncertainty by learning a $K\times K$ confusion matrix
+$\mathbf{M}$ that redistributes probability mass from a one-hot label toward
+semantically similar classes.
+
+\textbf{Initialization.}
+$\mathbf{M}$ is initialised as the identity plus small Gaussian noise,
+$\mathbf{M}\leftarrow\mathbf{I}+\boldsymbol{\varepsilon}$
+($\varepsilon_{ij}\sim\mathcal{N}(0,10^{-4})$),
+so training begins near one-hot labels with diagonal dominance guaranteed from the start.
+
+\textbf{Soft label generation.}
+For a one-hot label $\mathbf{y}\in\{0,1\}^K$, the CASL soft target is:
+\begin{eq}
+\[
+    g(\mathbf{y}) = \mathrm{softmax}(\mathbf{M}\mathbf{y}),
+    \qquad
+    \hat{\mathbf{y}}_{\text{CASL}} = \alpha\,g(\mathbf{y}) + (1-\alpha)\,\mathbf{y},\quad \alpha=0.1.
+\]
+\end{eq}
+Since $\mathbf{y}$ is one-hot for class $c$, $\mathbf{M}\mathbf{y}$ selects
+column $c$ of $\mathbf{M}$; the softmax normalises it into a valid distribution
+over all classes. $\alpha$ controls softness while preserving the ground-truth signal.
+
+\textbf{Dual loss and training.}
+Two losses are jointly minimised at every step:
+\begin{eq}
+\[
+    \mathcal{L}_g = -\frac{1}{K}\sum_k \bigl[\phi(\mathbf{x})\bigr]_k \log\bigl[g(\mathbf{y})\bigr]_k
+                   + (1-[\phi]_k)\log(1-[g]_k),
+    \qquad
+    \mathcal{L}_{\text{CASL}} = \mathcal{L}_g + \mathcal{L}(\mathbf{x},\hat{\mathbf{y}}_{\text{CASL}}).
+\]
+\end{eq}
+$\mathcal{L}_g$ uses binary cross-entropy with the \emph{classifier's own output}
+$\phi(\mathbf{x})$ as the supervision target for $\mathbf{M}$, forcing $\mathbf{M}$ to
+encode the confusion structure the classifier itself discovers.
+$\mathcal{L}(\mathbf{x},\hat{\mathbf{y}}_{\text{CASL}})$ then trains the classifier
+with the resulting soft targets.
+The two objectives create a \emph{cooperative loop}: the classifier's predictions
+supervise $\mathbf{M}$, while $\mathbf{M}$'s soft labels regularise the classifier.
+$\mathbf{M}$ is optimised with a separate Adam optimiser (lr $10^{-5}$ on CIFAR-100)
+and adds negligible overhead ($<\!2\%$ extra training time; $K^2=10{,}000$ parameters
+for $K=100$).
+
+% -------------------------------------------------------
+\section*{5\quad GCN: Adapting $\Sig$ Inspired by CASL}
+% -------------------------------------------------------
+
+The static $\Sig$ does not adapt to the student's evolving confusion.
+Inspired by CASL \cite{spanos}, we introduce a learnable $C\times C$
+matrix $\mathbf{M}$ (initialised as $\mathbf{I}+\boldsymbol{\varepsilon}$,
+$\varepsilon\sim\mathcal{N}(0,10^{-4})$) that adjusts $\Sig$ to track the
+student's current inter-class similarity pattern.
+
+\textbf{Adapted sigma:}
+\begin{eq}
+\[
+    \sighat = \alpha\,(\Sig\,\mathbf{M}) + (1-\alpha)\,\Sig.
+\]
+\end{eq}
+
+\textbf{Student confusion target $\Sig_S$.}
+At each step, the student's pairwise similarities are aggregated into a
+class-level matrix:
+\[
+    (\Sig_S)_{mn} = \frac{1}{|\{(i,j):c_i=m,c_j=n\}|}
+    \sum_{i:c_i=m}\sum_{j:c_j=n}
+    \frac{\mathbf{s}_i^\T\mathbf{s}_j+1}{2}.
+\]
+Three modes control which samples form rows/columns:
+\texttt{ab} (batch $\times$ anchors, default), \texttt{aa} (anchors $\times$ anchors),
+\texttt{bb} (batch $\times$ batch).
+
+\textbf{GCN loss} (optimised with a separate Adam optimiser; $\sighat$ is
+detached from the student graph):
+\begin{eq}
+\[
+    \mathcal{L}_G
+    = \mathrm{MSE}\!\left(\sighat\odot\mathbf{M}_{\text{obs}},\;
+                          \Sig_S\odot\mathbf{M}_{\text{obs}}\right),
+\]
+\end{eq}
+where $\mathbf{M}_{\text{obs}}$ masks out class pairs not observed in the batch.
+$\sighat$ then replaces $\Sig$ in all subsequent blending steps.
+
+% -------------------------------------------------------
+\section*{6\quad Hyperparameters}
+% -------------------------------------------------------
+
+\begin{center}
+\small
+\begin{tabular}{llll}
+\toprule
+Symbol & Meaning & Default \\
+\midrule
+$\beta$ & AKD distillation weight & 10.0 \\
+$\ell_1,\,\ell_2$ & KL term weights & 1.0,\;0.1 \\
+$\tau$ & Sigma temperature ($<1$ sharpens) & 0.2 \\
+$\alpha$ & GCN blending weight & 0.1 \\
+$\eta_G$ & GCN learning rate & $10^{-4}$ \\
+$\lambda_{\min}$ & Adaptive lambda floor & 0.7 \\
+$k$ & Sigmoid steepness & 10.0 \\
+$d_0$ & Sigmoid midpoint (normalised disagreement) & 0.3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+\begin{thebibliography}{1}
+\bibitem{spanos}
+G.~Spanos et al., \textit{Improving uncertainty estimation in deep neural networks by modeling class and instance uncertainty}, 2019.
+\end{thebibliography}
+
+\end{document}

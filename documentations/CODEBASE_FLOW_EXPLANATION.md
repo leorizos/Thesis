@@ -1,0 +1,603 @@
+# Complete Codebase Flow Explanation
+## Knowledge Distillation Framework with Probabilistic Knowledge Transfer (PKT)
+
+This codebase implements a comprehensive knowledge distillation framework based on the paper **"Learning Deep Representations with Probabilistic Knowledge Transfer"** by Nikolaos Passalis and Anastasios Tefas (ECCV 2018). It supports multiple knowledge distillation methods including PKT, KD, FitNet, Attention Transfer, Similarity Preservation, VID, CRD, SemCKD, SRRL, and SimKD.
+
+---
+
+## 1. Overview of Knowledge Distillation
+
+### What is Knowledge Distillation?
+
+Knowledge Distillation (KD) is a technique where knowledge from a large, complex neural network (**TEACHER**) is transferred to a smaller, faster network (**STUDENT**). This allows:
+- Deploying smaller models on mobile/embedded devices
+- Faster inference with minimal accuracy loss
+- Better generalization through teacher supervision
+
+### The PKT Approach (From the Paper)
+
+Unlike traditional methods that transfer knowledge through output logits or intermediate features, PKT transfers knowledge by matching the **PROBABILITY DISTRIBUTIONS** of data in the feature space:
+
+1. **Feature Extraction**: Both teacher and student extract features from data
+2. **Similarity Computation**: Cosine similarities are computed between all pairs of samples in the batch
+3. **Probability Conversion**: Similarities are converted to probability distributions
+4. **Distribution Matching**: KL-divergence minimizes difference between teacher and student probability distributions
+
+#### Key Advantages of PKT:
+- Works with different network dimensionalities (teacher/student don't need same size)
+- Preserves local geometry of feature space
+- Can transfer from handcrafted features to neural networks
+- Supports cross-modal knowledge transfer
+
+---
+
+## 2. Complete Training Flow
+
+### PHASE 1: Teacher Training (`train_teacher.py`)
+
+**Purpose:** Train a large, accurate teacher model
+
+#### Step-by-step flow:
+
+**1. Initialization**
+- Load CIFAR-100 or ImageNet dataset
+- Initialize teacher model (e.g., ResNet32x4)
+- Setup optimizer (SGD with momentum)
+- Setup CrossEntropy loss for classification
+
+**2. Training Loop** (for each epoch):
+
+```
+a) Forward Pass
+   - Input batch: [B, 3, 32, 32] for CIFAR-100
+   - Model output: logits [B, 100] for 100 classes
+
+b) Loss Calculation
+   - loss = CrossEntropy(logits, labels)
+
+c) Backward Pass
+   - Compute gradients
+   - Update weights using SGD
+
+d) Learning Rate Schedule
+   - Decay at epochs 150, 180, 210
+   - Multiply by 0.1 at each decay step
+
+e) Validation
+   - Evaluate on test set
+   - Save best model checkpoint
+```
+
+**3. Output**
+- Saved model: `save/teachers/models/{model_name}_best.pth`
+- Contains: model state_dict, epoch, best_acc
+- Metrics: `test_best_metrics.json` with accuracy stats
+
+---
+
+### PHASE 2: Student Training with Distillation (`train_student.py`)
+
+**Purpose:** Train a smaller student model using teacher's knowledge
+
+#### Step-by-step flow:
+
+**1. Initialization**
+```
+a) Load pre-trained teacher model from checkpoint
+b) Initialize student model (e.g., ResNet8x4 - much smaller)
+c) Setup distillation method (PKT, KD, FitNet, etc.)
+d) Create module_list: [student, distillation_modules..., teacher]
+e) Create criterion_list: [cls_loss, kl_div, distill_loss]
+```
+
+**2. Feature Extraction Setup**
+
+Both teacher and student models output:
+- **Features list**: [f0, f1, f2, f3, f4] from different layers
+- **Final logits**: [B, num_classes]
+
+Example for ResNet on CIFAR-100:
+```
+f0: [B, 64, 32, 32]   # After conv1+bn1+relu
+f1: [B, 64, 32, 32]   # After layer1
+f2: [B, 128, 16, 16]  # After layer2
+f3: [B, 256, 8, 8]    # After layer3
+f4: [B, 256]          # After avgpool (pooled features)
+logits: [B, 100]      # Final classification output
+```
+
+**3. Distillation Loss Components**
+
+For each batch, three loss components are calculated:
+
+#### a) Classification Loss (loss_cls)
+- Standard cross-entropy on student logits
+- `loss_cls = CrossEntropy(student_logits, true_labels)`
+- Weight: `--cls` (default: 1.0)
+
+#### b) KL Divergence Loss (loss_div)
+- Matches softened probability distributions
+- Temperature T=4 softens the distributions
+- `loss_div = KL(softmax(student_logits/T), softmax(teacher_logits/T))`
+- Weight: `--div` (default: 1.0)
+
+#### c) Distillation-Specific Loss (loss_kd)
+
+**FOR PKT (Probabilistic Knowledge Transfer):**
+
+```
+Step 1: Extract final pooled features
+   student_feat = feat_s[-1]  # Shape: [B, 256]
+   teacher_feat = feat_t[-1]  # Shape: [512] (teacher is larger)
+
+Step 2: Normalize features
+   student_norm = student_feat / ||student_feat||_2
+   teacher_norm = teacher_feat / ||teacher_feat||_2
+
+Step 3: Compute cosine similarity matrices
+   S_student = student_norm @ student_norm^T  # Shape: [B, B]
+   S_teacher = teacher_norm @ teacher_norm^T  # Shape: [B, B]
+
+   Each element S[i,j] = cosine_similarity(feat_i, feat_j)
+
+Step 4: Scale to [0, 1] range
+   S_student = (S_student + 1) / 2
+   S_teacher = (S_teacher + 1) / 2
+
+Step 5: Convert to probability distributions
+   P_student[i,j] = S_student[i,j] / sum_k(S_student[i,k])
+   P_teacher[i,j] = S_teacher[i,j] / sum_k(S_teacher[i,k])
+
+   Now each row sums to 1 (probability distribution)
+
+Step 6: Calculate KL-divergence
+   loss_pkt = mean_i(sum_j(P_teacher[i,j] * log(P_teacher[i,j] / P_student[i,j])))
+```
+
+Weight: `--beta` (for PKT: usually 1.0)
+
+#### d) Combined Loss
+```python
+total_loss = cls_weight * loss_cls + div_weight * loss_div + beta * loss_kd
+```
+
+Example for PKT:
+```
+total_loss = 1.0 * loss_cls + 1.0 * loss_div + 1.0 * loss_pkt
+```
+
+**4. Training Loop** (for each epoch):
+```
+a) Forward Pass
+   - Student forward: feat_s, logit_s = model_s(images, is_feat=True)
+   - Teacher forward (no_grad): feat_t, logit_t = model_t(images, is_feat=True)
+
+b) Loss Calculation
+   - Calculate all three loss components
+   - Combine according to weights
+
+c) Backward Pass
+   - Only student parameters are updated
+   - Teacher parameters are frozen (no gradient computation)
+
+d) Optimization
+   - SGD updates student model
+   - Same learning rate schedule as teacher
+
+e) Validation
+   - For most methods: use student's direct output
+   - For SimKD: use projection module + teacher classifier
+   - Save best student model
+```
+
+**5. Output**
+- Saved model: `save/students/models/S~{student}_T~{teacher}_{dataset}_{method}_best.pth`
+- Contains: student state_dict, epoch, best_acc
+- Metrics: `test_best_metrics.json`, `parameters.json`
+
+---
+
+## 3. Detailed Data Flow Example (PKT on CIFAR-100)
+
+### Input Data:
+```
+Batch size: 64
+Images: [64, 3, 32, 32] RGB images
+Labels: [64] class indices (0-99)
+```
+
+### Step 1: Student Forward Pass
+
+**model_s = resnet8x4** (8 layers, 4x width)
+
+```
+Architecture: conv1 -> bn1 -> relu -> layer1 -> layer2 -> layer3 -> avgpool -> fc
+
+Input: [64, 3, 32, 32]
+  ↓
+conv1: [64, 64, 32, 32] --> f0
+  ↓
+layer1: [64, 64, 32, 32] --> f1
+  ↓
+layer2: [64, 128, 16, 16] --> f2
+  ↓
+layer3: [64, 256, 8, 8] --> f3
+  ↓
+avgpool: [64, 256] --> f4 (used for PKT)
+  ↓
+fc: [64, 100] --> logits
+```
+
+### Step 2: Teacher Forward Pass (with torch.no_grad())
+
+**model_t = resnet32x4** (32 layers, 4x width, more powerful)
+
+```
+Input: [64, 3, 32, 32]
+  ↓
+  [similar architecture but deeper]
+  ↓
+avgpool: [64, 512] --> f4_teacher (larger dimension)
+  ↓
+fc: [64, 100] --> logits_teacher
+```
+
+### Step 3: Loss Calculation
+
+#### A) Classification Loss:
+```
+loss_cls = CrossEntropy(student_logits, labels)
+Example: 2.45
+```
+
+#### B) KL Divergence Loss:
+```python
+student_soft = softmax(student_logits / 4.0)
+teacher_soft = softmax(teacher_logits / 4.0)
+loss_div = KL(student_soft, teacher_soft)
+Example: 0.82
+```
+
+#### C) PKT Loss:
+```python
+student_feat = f4 = [64, 256]
+teacher_feat = f4_teacher = [64, 512]
+
+# Normalize
+student_norm = student_feat / ||student_feat||_2
+# student_norm: [64, 256]
+
+teacher_norm = teacher_feat / ||teacher_feat||_2
+# teacher_norm: [64, 512]
+
+# Compute similarity matrices
+S_student = student_norm @ student_norm.T
+# S_student: [64, 64] where S[i,j] = cos(student_i, student_j)
+
+S_teacher = teacher_norm @ teacher_norm.T
+# S_teacher: [64, 64] where S[i,j] = cos(teacher_i, teacher_j)
+
+# Scale to [0,1]
+S_student = (S_student + 1) / 2  # from [-1,1] to [0,1]
+S_teacher = (S_teacher + 1) / 2
+
+# Row-wise normalization to probabilities
+P_student = S_student / S_student.sum(dim=1, keepdim=True)
+P_teacher = S_teacher / S_teacher.sum(dim=1, keepdim=True)
+# Each row now sums to 1.0
+
+# KL divergence
+loss_pkt = (P_teacher * log(P_teacher / P_student)).mean()
+Example: 1.15
+```
+
+#### D) Total Loss:
+```
+total = 1.0 * 2.45 + 1.0 * 0.82 + 1.0 * 1.15 = 4.42
+```
+
+### Step 4: Backpropagation
+```python
+optimizer.zero_grad()
+total_loss.backward()  # Computes gradients only for student
+optimizer.step()       # Updates student parameters
+```
+
+### Step 5: Validation
+- Every epoch, evaluate student on test set
+- Compute top-1 and top-5 accuracy
+- Save best model
+
+---
+
+## 4. Key Architectural Components
+
+### Model Architectures (`models/`)
+
+#### ResNet Family (`resnet.py`):
+- `resnet8x4`: 8 layers, width [32, 64, 128, 256]
+- `resnet32x4`: 32 layers, width [32, 64, 128, 256]
+- `resnet110`: 110 layers, width [16, 32, 64]
+
+#### Key Method: `forward(x, is_feat=False)`
+
+When `is_feat=True`:
+- Returns: `([f0, f1, f2, f3, f4], logits)`
+- Used for knowledge distillation
+
+When `is_feat=False`:
+- Returns: `logits`
+- Used for standard inference
+
+---
+
+### Dataset Loaders (`dataset/`)
+
+#### CIFAR-100 (`cifar100.py`):
+
+**`get_cifar100_dataloaders()`:**
+- Standard loader for classification
+
+**`get_cifar100_dataloaders_sample()`:**
+- Extended loader for CRD (Contrastive Representation Distillation)
+- Returns: `(image, label, index, contrastive_indices)`
+
+**Transformations:**
+- **Training**: RandomCrop(32, pad=4), RandomHorizontalFlip, Normalize
+- **Testing**: Normalize only
+
+---
+
+### Distillation Methods (`distiller_zoo/`)
+
+| Method | Description |
+|--------|-------------|
+| **PKT** | Matches probability distributions in feature space using cosine similarity + KL divergence. Works with different dimensionalities |
+| **KD** | Classic method by Hinton et al. Softened probability matching with temperature |
+| **FitNet** | Matches intermediate layer features using ConvReg for dimension alignment |
+| **Attention** | Matches spatial attention maps applied to multiple layer pairs |
+| **Similarity** | Matches Gram matrices (pairwise similarities) |
+| **VID** | Probabilistic approach with learned variance |
+| **CRD** | Contrastive learning with memory bank and NCE loss |
+| **SemCKD** | Cross-layer matching with self-attention that learns which layers to match |
+| **SRRL** | Transforms student features with MSE loss on transformed features |
+| **SimKD** | Channel alignment + reuses teacher classifier. Very efficient and effective |
+
+---
+
+### Training Utilities (`helper/`)
+
+#### `loops.py`:
+- `train_vanilla()`: Standard supervised training
+- `train_distill()`: Knowledge distillation training
+- `validate_vanilla()`: Standard evaluation
+- `validate_distill()`: Distillation-aware evaluation
+
+#### `util.py`:
+- `AverageMeter`: Running averages for metrics
+- `adjust_learning_rate()`: Step-wise LR decay
+- `accuracy()`: Top-k accuracy computation
+- `reduce_tensor()`: Distributed training support
+
+---
+
+## 5. Why PKT Works (Insights from the Paper)
+
+### Traditional Methods Limitations:
+
+**1. Direct feature matching:** `||student_feat - teacher_feat||^2`
+- Requires same dimensionality
+- Doesn't preserve relative relationships
+- Teacher's capacity >> Student's capacity (infeasible to match exactly)
+
+**2. Logit-based distillation:**
+- Only transfers final layer knowledge
+- Ignores intermediate representations
+- Limited to classification tasks
+
+### PKT Advantages:
+
+#### 1. Probability Distribution Matching:
+- Instead of matching features directly, match their pairwise relationships
+- A similarity matrix captures: "which samples are similar to each other?"
+- This is more flexible than exact feature matching
+
+#### 2. Mathematical Foundation:
+The paper proves that matching probability distributions maintains the **Quadratic Mutual Information (QMI)** between features and labels.
+
+QMI measures how much information features contain about labels. If teacher has high QMI, student inherits this property.
+
+#### 3. Geometry Preservation:
+By matching similarity matrices, PKT preserves:
+- Local neighborhoods (nearby samples stay nearby)
+- Manifold structure (data distribution geometry)
+- Relative distances (if A similar to B in teacher, also in student)
+
+#### 4. Dimensionality Flexibility:
+```
+Teacher feature: [B, 512]
+Student feature: [B, 256]
+Similarity matrices: Both [B, B]
+No alignment needed!
+```
+
+#### 5. Cross-Modal Transfer:
+The paper demonstrates transferring from:
+- Handcrafted features (HOG, SIFT) → Neural networks
+- Textual attributes → Visual features
+- Object detectors → Classification networks
+
+---
+
+## 6. Practical Training Workflow
+
+### STEP 1: Train Teacher
+
+```bash
+python train_teacher.py --model resnet32x4 --dataset cifar100 --epochs 240
+```
+
+**Output:**
+- Teacher model: `save/teachers/models/resnet32x4_vanilla_cifar100_trial_0/`
+- Test accuracy: ~78% top-1
+
+### STEP 2: Train Student with PKT
+
+```bash
+python train_student.py \
+  --model_s resnet8x4 \
+  --path_t save/teachers/models/resnet32x4_vanilla_cifar100_trial_0/resnet32x4_best.pth \
+  --distill pkt \
+  --dataset cifar100 \
+  --cls 1.0 \
+  --div 1.0 \
+  --beta 1.0 \
+  --epochs 240
+```
+
+**What happens:**
+1. Load teacher ResNet32x4 (11M parameters)
+2. Initialize student ResNet8x4 (700x smaller: ~15K parameters)
+3. For each batch:
+   - Extract features from both
+   - Compute PKT loss on final pooled features
+   - Compute classification + KL divergence losses
+   - Update only student weights
+4. Save best student model
+
+**Output:**
+- Student model: `save/students/models/S~resnet8x4_T~resnet32x4_cifar100_pkt_r~1.0_a~1.0_b~1.0_0/`
+- Test accuracy: ~72% top-1 (compared to ~69% without distillation)
+
+### STEP 3: Evaluate
+
+The saved model contains everything needed for deployment:
+- Small size (15K parameters vs 11M teacher)
+- Good accuracy (72% vs 78% teacher, 69% baseline)
+- Fast inference
+
+---
+
+## 7. Hyperparameter Guide
+
+### Loss Weights:
+```
+--cls: Weight for classification loss (recommended: 1.0)
+--div: Weight for KL divergence (recommended: 1.0)
+--beta: Weight for distillation loss (method-specific)
+```
+
+**For PKT:**
+```bash
+--beta 1.0  # equal importance to all three losses
+```
+
+**Alternative configurations:**
+```bash
+--cls 0 --div 0 --beta 1.0  # pure PKT, no classification supervision
+--cls 1 --div 0 --beta 2.0  # emphasize PKT over KD
+```
+
+### Learning Rate:
+- Default: 0.05 for ResNets
+- Special: 0.01 for MobileNets/ShuffleNets
+- Decay: 0.1x at epochs 150, 180, 210
+
+### Temperature (for KL divergence):
+```
+--kd_T: Temperature parameter (default: 4)
+```
+- Higher temperature: Softer probabilities, more information transfer
+- Lower temperature: Closer to hard labels
+
+### Batch Size:
+- CIFAR-100: 64 (default)
+- ImageNet: 256 (requires more memory)
+- Larger batches help PKT (more samples for similarity computation)
+
+---
+
+## 8. Performance Expectations (from paper)
+
+### CIFAR-100 Results:
+
+**Teacher:** ResNet32x4 → **Student:** ResNet8x4
+
+| Method | Accuracy |
+|--------|----------|
+| Baseline student (no distillation) | 69.2% |
+| KD (Hinton) | 70.5% |
+| FitNet | 68.1% |
+| Attention Transfer | 70.3% |
+| **PKT (proposed)** | **72.1%** |
+
+### Why PKT Performs Better:
+1. Preserves geometry of teacher's feature space
+2. Flexible dimension matching
+3. Focuses on relationships, not absolute values
+4. Regularizes student through distribution matching
+
+---
+
+## 9. Code Organization Summary
+
+```
+train_teacher.py          # Teacher training entry point
+train_student.py          # Student distillation entry point
+
+models/
+  __init__.py             # Model registry
+  resnet.py               # ResNet for CIFAR-100
+  resnet_imagenet.py      # ResNet for ImageNet
+  util.py                 # Projection modules (ConvReg, SelfA, SRRL, SimKD)
+
+dataset/
+  cifar100.py             # CIFAR-100 loaders
+  imagenet.py             # ImageNet loaders
+
+distiller_zoo/
+  PKT.py                  # Probabilistic Knowledge Transfer (MAIN ALGORITHM)
+  KD.py                   # Classic knowledge distillation
+  FitNet.py, AT.py, SP.py # Other methods
+  VID.py, SemCKD.py       # Advanced methods
+  __init__.py             # Distiller registry
+
+helper/
+  loops.py                # Training/validation loops
+  util.py                 # Utility functions
+
+crd/
+  criterion.py            # Contrastive Representation Distillation loss
+  memory.py               # Memory bank for CRD
+
+save/
+  teachers/               # Saved teacher models
+  students/               # Saved student models
+```
+
+---
+
+## 10. Extending the Codebase
+
+### To Add a New Distillation Method:
+1. Create new file in `distiller_zoo/`
+2. Implement `nn.Module` with `forward(feat_s, feat_t)`
+3. Add to `distiller_zoo/__init__.py`
+4. Add choice in `train_student.py` (line 63)
+5. Add loss computation in `helper/loops.py` (`train_distill`)
+
+### To Add a New Model:
+1. Create file in `models/`
+2. Implement `forward(x, is_feat=False)`
+3. Implement `get_feat_modules()`
+4. Add to `models/__init__.py` model_dict
+
+### To Add a New Dataset:
+1. Create file in `dataset/`
+2. Implement `get_{dataset}_dataloaders()`
+3. Define transforms
+4. Add to `train_teacher.py` and `train_student.py`
+
+---
+
+## End of Codebase Flow Explanation

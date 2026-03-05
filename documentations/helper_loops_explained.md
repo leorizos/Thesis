@@ -1,0 +1,466 @@
+---
+helper/loops.py - TRAINING AND VALIDATION LOOPS
+---
+
+PURPOSE:
+Contains the core training and validation functions used by both teacher and
+student training scripts. Handles the batch-by-batch iteration, loss computation,
+metric tracking, and logging.
+
+---
+FUNCTIONS OVERVIEW
+---
+
+1. train_vanilla(epoch, train_loader, model, criterion, optimizer, opt)
+   - Standard supervised training (for teachers)
+   - No knowledge distillation
+
+2. train_distill(epoch, train_loader, module_list, criterion_list, optimizer, opt)
+   - Knowledge distillation training (for students)
+   - Handles multiple distillation methods
+
+3. validate_vanilla(val_loader, model, criterion, opt)
+   - Standard validation (for teachers and most students)
+
+4. validate_distill(val_loader, module_list, criterion, opt)
+   - Validation for distillation (special handling for SimKD)
+
+---
+FUNCTION: train_vanilla()
+---
+
+SIGNATURE:
+def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
+
+PURPOSE:
+Trains a model for one epoch using standard supervised learning.
+
+INPUTS:
+- epoch: Current epoch number (for logging)
+- train_loader: DataLoader providing batches of (images, labels)
+- model: Neural network to train
+- criterion: Loss function (typically CrossEntropyLoss)
+- optimizer: Optimizer (typically SGD)
+- opt: Configuration object with print_freq, gpu settings, etc.
+
+OUTPUTS:
+Returns (top1_acc, top5_acc, avg_loss) for the epoch
+
+FLOW:
+1. Set model to train mode: model.train()
+2. Initialize metric trackers (AverageMeter for loss, top1, top5, batch_time)
+3. For each batch:
+   a. Load images and labels, move to GPU
+   b. Forward pass: output = model(images)
+   c. Compute loss: loss = criterion(output, labels)
+   d. Compute accuracy: accuracy(output, labels, topk=(1, 5))
+   e. Backward pass: loss.backward()
+   f. Optimizer step: optimizer.step()
+   g. Update metric trackers
+   h. Print progress every print_freq batches
+
+KEY DETAILS:
+
+DEVICE PLACEMENT:
+  if opt.gpu is not None:
+      images = images.cuda(opt.gpu if opt.multiprocessing_distributed else 0, non_blocking=True)
+
+  - non_blocking=True: Allows async GPU transfer for better performance
+  - Handles both single GPU and distributed training
+
+FORWARD PASS:
+  output = model(images)
+
+  - Note: is_feat=False by default, so only returns logits
+  - Shape: [B, num_classes]
+
+METRICS:
+  - top1: Percentage of samples where top prediction is correct
+  - top5: Percentage of samples where correct label is in top 5 predictions
+  - Both updated using AverageMeter for running average
+
+PRINTING:
+  if idx % opt.print_freq == 0:
+      print('Epoch: [{0}][{1}/{2}]\t'
+            'GPU {3}\t'
+            'Time: {batch_time.avg:.3f}\t'
+            'Loss {loss.avg:.4f}\t'
+            'Acc@1 {top1.avg:.3f}\t'
+            'Acc@5 {top5.avg:.3f}'.format(...))
+
+  Example output:
+    Epoch: [1][200/782]  GPU 0  Time: 0.142  Loss 4.1523  Acc@1 3.281  Acc@5 12.109
+
+DISTRIBUTED TRAINING:
+  - Metrics automatically aggregate across GPUs in main_worker
+
+---
+FUNCTION: train_distill()
+---
+
+SIGNATURE:
+def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, opt):
+
+PURPOSE:
+Trains a student model for one epoch using knowledge distillation.
+
+INPUTS:
+- epoch: Current epoch number
+- train_loader: DataLoader (may include contrastive samples for CRD)
+- module_list: List of [student, optional_modules..., teacher]
+- criterion_list: List of [cls_criterion, div_criterion, kd_criterion]
+- optimizer: Optimizer (only updates student + trainable modules)
+- opt: Configuration with distillation method, weights, etc.
+
+OUTPUTS:
+Returns (top1_acc, top5_acc, avg_loss) for the epoch
+
+FLOW:
+1. Set all modules to train mode EXCEPT teacher
+   for module in module_list:
+       module.train()
+   module_list[-1].eval()  # Teacher stays in eval mode
+
+2. Extract components:
+   model_s = module_list[0]   # Student
+   model_t = module_list[-1]  # Teacher
+   criterion_cls = criterion_list[0]  # Classification
+   criterion_div = criterion_list[1]  # KL divergence
+   criterion_kd = criterion_list[2]   # Distillation-specific
+
+3. For each batch:
+   a. Load data (handle CRD special case)
+   b. Student forward pass with features
+   c. Teacher forward pass (no_grad) with features
+   d. Extract teacher classifier
+   e. Compute three loss components
+   f. Combine losses with weights
+   g. Backward and optimize
+
+KEY DISTILLATION LOGIC:
+
+DATA LOADING:
+  if opt.distill in ['crd']:
+      images, labels, index, contrast_idx = data
+  else:
+      images, labels = data
+
+  CRD needs additional indices for contrastive learning
+
+FEATURE EXTRACTION:
+  feat_s, logit_s = model_s(images, is_feat=True)
+  with torch.no_grad():
+      feat_t, logit_t = model_t(images, is_feat=True)
+      feat_t = [f.detach() for f in feat_t]
+
+  is_feat=True returns:
+  - feat_s: List [f0, f1, f2, f3, f4] of intermediate features
+  - logit_s: Final classification output [B, num_classes]
+
+  Teacher is in no_grad() context:
+  - No gradient computation
+  - Saves memory
+  - Teacher not updated
+
+TEACHER CLASSIFIER EXTRACTION:
+  cls_t = model_t.module.get_feat_modules()[-1] if opt.multiprocessing_distributed else model_t.get_feat_modules()[-1]
+
+  - Extracts final classifier layer from teacher
+  - Needed for SRRL and SimKD methods
+  - .module handles DistributedDataParallel wrapper
+
+LOSS COMPUTATION (method-specific):
+
+For PKT:
+  elif opt.distill == 'pkt':
+      f_s = feat_s[-1]  # Final pooled features
+      f_t = feat_t[-1]
+      loss_kd = criterion_kd(f_s, f_t)
+
+For FitNet:
+  elif opt.distill == 'hint':
+      f_s, f_t = module_list[1](feat_s[opt.hint_layer], feat_t[opt.hint_layer])
+      loss_kd = criterion_kd(f_s, f_t)
+
+  module_list[1] is ConvReg (projection module)
+
+For Attention Transfer:
+  elif opt.distill == 'attention':
+      g_s = feat_s[1:-1]  # Exclude first and last
+      g_t = feat_t[1:-1]
+      loss_group = criterion_kd(g_s, g_t)  # List of losses
+      loss_kd = sum(loss_group)  # Sum over layers
+
+For SimKD:
+  elif opt.distill == 'simkd':
+      trans_feat_s, trans_feat_t, pred_feat_s = module_list[1](feat_s[-2], feat_t[-2], cls_t)
+      logit_s = pred_feat_s  # IMPORTANT: Replace student logits!
+      loss_kd = criterion_kd(trans_feat_s, trans_feat_t)
+
+  SimKD replaces student's logits with predicted logits from teacher's classifier
+
+COMBINED LOSS:
+  loss = opt.cls * loss_cls + opt.div * loss_div + opt.beta * loss_kd
+
+  Example with --cls 1.0 --div 1.0 --beta 1.0:
+    loss = 1.0 * 2.45 + 1.0 * 0.82 + 1.0 * 1.15 = 4.42
+
+BACKWARD AND OPTIMIZE:
+  optimizer.zero_grad()
+  loss.backward()  # Gradients only for student + trainable modules
+  optimizer.step()  # Updates only trainable_list parameters
+
+SPECIAL HANDLING:
+
+SemCKD batch size check:
+  if opt.distill == 'semckd' and images.shape[0] < opt.batch_size:
+      continue
+
+  SemCKD's self-attention requires full batch size, skips partial batches
+
+---
+FUNCTION: validate_vanilla()
+---
+
+SIGNATURE:
+def validate_vanilla(val_loader, model, criterion, opt):
+
+PURPOSE:
+Evaluates model on validation set using standard forward pass.
+
+FLOW:
+1. Set model to eval mode: model.eval()
+2. Disable gradients: with torch.no_grad()
+3. For each batch:
+   a. Forward pass
+   b. Compute loss and accuracy
+   c. Update metrics
+4. Handle distributed aggregation if needed
+5. Return average metrics
+
+KEY DETAILS:
+
+EVAL MODE:
+  model.eval()
+
+  - Disables dropout
+  - Batch normalization uses running statistics (not batch statistics)
+  - Ensures consistent evaluation
+
+NO GRADIENT:
+  with torch.no_grad():
+
+  - Prevents gradient computation
+  - Saves memory
+  - Faster inference
+
+DISTRIBUTED VALIDATION:
+  if opt.multiprocessing_distributed:
+      total_metrics = torch.tensor([top1.sum, top5.sum, losses.sum]).to(opt.gpu)
+      count_metrics = torch.tensor([top1.count, top5.count, losses.count]).to(opt.gpu)
+      total_metrics = reduce_tensor(total_metrics, 1)
+      count_metrics = reduce_tensor(count_metrics, 1)
+      ret = []
+      for s, n in zip(total_metrics.tolist(), count_metrics.tolist()):
+          ret.append(s / (1.0 * n))
+      return ret
+
+  Why sum then divide?
+  - Different GPUs may have different batch sizes (last batch)
+  - Summing totals then dividing by counts gives correct average
+  - reduce_tensor does AllReduce (sums across GPUs)
+
+---
+FUNCTION: validate_distill()
+---
+
+SIGNATURE:
+def validate_distill(val_loader, module_list, criterion, opt):
+
+PURPOSE:
+Evaluates student model, with special handling for SimKD.
+
+FLOW:
+1. Set all modules to eval mode
+2. For each batch:
+   a. If SimKD: Use projection module + teacher classifier
+   b. Else: Standard student forward pass
+   c. Compute loss and accuracy
+3. Return metrics
+
+SIMKD SPECIAL HANDLING:
+  if opt.distill == 'simkd':
+      feat_s, _ = model_s(images, is_feat=True)
+      feat_t, _ = model_t(images, is_feat=True)
+      feat_t = [f.detach() for f in feat_t]
+      cls_t = model_t.module.get_feat_modules()[-1] if opt.multiprocessing_distributed else model_t.get_feat_modules()[-1]
+      _, _, output = module_list[1](feat_s[-2], feat_t[-2], cls_t)
+  else:
+      output = model_s(images)
+
+  Why?
+  - SimKD doesn't train student's classifier
+  - Uses teacher's classifier at test time too
+  - Must go through projection module during validation
+
+OTHER METHODS:
+  - Use student's own classifier
+  - Standard forward pass
+
+---
+HELPER CLASSES
+---
+
+AVERAGEMETER (from util.py, used extensively):
+
+  class AverageMeter(object):
+      def __init__(self):
+          self.reset()
+
+      def reset(self):
+          self.val = 0
+          self.avg = 0
+          self.sum = 0
+          self.count = 0
+
+      def update(self, val, n=1):
+          self.val = val
+          self.sum += val * n
+          self.count += n
+          self.avg = self.sum / self.count
+
+  USAGE:
+    losses = AverageMeter()
+    top1 = AverageMeter()
+
+    for idx, (images, labels) in enumerate(train_loader):
+        ...
+        loss = criterion(output, labels)
+        acc = accuracy(output, labels, topk=(1,))
+
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc[0].item(), images.size(0))
+
+    print('Average loss:', losses.avg)
+    print('Average top-1 accuracy:', top1.avg)
+
+  Properties:
+  - val: Last value
+  - avg: Running average
+  - sum: Cumulative sum
+  - count: Total count
+
+ACCURACY FUNCTION (from util.py):
+
+  def accuracy(output, target, topk=(1,)):
+      with torch.no_grad():
+          maxk = max(topk)
+          batch_size = target.size(0)
+
+          _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
+          pred = pred.t()
+          correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+          res = []
+          for k in topk:
+              correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+              res.append(correct_k.mul_(100.0 / batch_size))
+          return res
+
+  EXAMPLE:
+    output = [[0.1, 0.8, 0.05, 0.05],  # Predicts class 1
+              [0.3, 0.2, 0.4, 0.1]]    # Predicts class 2
+    target = [1, 2]
+
+    acc1, acc5 = accuracy(output, target, topk=(1, 5))
+    # acc1 = 100.0 (both correct)
+    # acc5 = 100.0 (trivial with only 4 classes)
+
+---
+TYPICAL USAGE FLOW
+---
+
+TEACHER TRAINING (in train_teacher.py):
+  for epoch in range(1, opt.epochs + 1):
+      adjust_learning_rate(epoch, opt, optimizer)
+
+      train_acc, train_acc_top5, train_loss = train_vanilla(
+          epoch, train_loader, model, criterion, optimizer, opt)
+
+      test_acc, test_acc_top5, test_loss = validate_vanilla(
+          val_loader, model, criterion, opt)
+
+      if test_acc > best_acc:
+          save_model(...)
+
+STUDENT TRAINING (in train_student.py):
+  for epoch in range(1, opt.epochs + 1):
+      adjust_learning_rate(epoch, opt, optimizer)
+
+      train_acc, train_acc_top5, train_loss = train_distill(
+          epoch, train_loader, module_list, criterion_list, optimizer, opt)
+
+      test_acc, test_acc_top5, test_loss = validate_distill(
+          val_loader, module_list, criterion_cls, opt)
+
+      if test_acc > best_acc:
+          save_model(...)
+
+---
+PERFORMANCE CONSIDERATIONS
+---
+
+TIMING:
+- Each epoch on CIFAR-100 (50K images, batch=64): ~2 minutes on modern GPU
+- Validation (10K images): ~15 seconds
+
+BOTTLENECKS:
+1. Forward/backward pass (majority of time)
+2. Data loading (mitigated by num_workers)
+3. Metric computation (negligible)
+4. Printing (negligible unless print_freq too low)
+
+OPTIMIZATION:
+- Use pin_memory=True in DataLoader (already done)
+- Use non_blocking=True for GPU transfers (already done)
+- Use cudnn.benchmark=True (already done)
+- Increase num_workers if CPU strong (default 8)
+
+MEMORY:
+- Largest allocation: Activations during backward pass
+- Student + teacher both in memory during distillation
+- Similarity matrices for PKT (B×B, usually small)
+
+---
+DEBUGGING TIPS
+---
+
+ADD PRINTS FOR DEBUGGING:
+
+In train_distill, add:
+  print(f"loss_cls: {loss_cls.item():.4f}, "
+        f"loss_div: {loss_div.item():.4f}, "
+        f"loss_kd: {loss_kd.item():.4f}")
+
+Monitor loss components separately.
+
+CHECK GRADIENT FLOW:
+  for name, param in model_s.named_parameters():
+      if param.grad is not None:
+          print(f"{name}: grad_norm={param.grad.norm().item():.4f}")
+
+Ensures gradients are flowing (not zero, not NaN).
+
+VERIFY TEACHER FROZEN:
+  for param in model_t.parameters():
+      assert param.grad is None, "Teacher should not have gradients!"
+
+CHECK DATA:
+  print(f"Images: min={images.min()}, max={images.max()}, mean={images.mean()}")
+  print(f"Labels: {labels[:10]}")
+
+Ensures data is normalized correctly.
+
+---
+END OF helper/loops.py EXPLANATION
+---

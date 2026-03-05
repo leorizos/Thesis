@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS metadata
+.DS_Store
+
+# Windows artifacts
+nul
+
+# Claude Code settings
+.claude/
+
+# Research papers (large PDFs, not code)
+*.pdf
+
+# Scratch notebooks
+*.ipynb
+
+# The save/ directory has its own .gitignore which excludes:
+# - model weights (*.pth)
+# - numpy arrays (*.npy, *.pt)
+# - OOD score caches
+# - tensorboard logs
+# - training plots (*.png)
+# Only class_similarity_matrix.npy and .gitignore itself survive there,
+# but class_similarity_matrix.npy is also a generated file so that's fine.

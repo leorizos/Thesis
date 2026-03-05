@@ -1,0 +1,485 @@
+================================================================================
+dataset/cifar100.py - CIFAR-100 DATA LOADING
+================================================================================
+
+PURPOSE:
+Provides data loaders for CIFAR-100 dataset with:
+1. Standard loading for most distillation methods
+2. Contrastive sampling for CRD (Contrastive Representation Distillation)
+
+================================================================================
+CIFAR-100 DATASET OVERVIEW
+================================================================================
+
+STATISTICS:
+- 100 classes (20 superclasses)
+- 600 images per class
+- Training: 50,000 images (500 per class)
+- Testing: 10,000 images (100 per class)
+- Image size: 32×32×3 RGB
+- Color images in natural scene categories
+
+CLASSES:
+Examples: apple, aquarium_fish, baby, bear, beaver, bed, bee, bicycle, bottle,
+bowl, boy, bridge, bus, butterfly, camel, can, castle, caterpillar, cattle,
+chair, chimpanzee, clock, cloud, cockroach, couch, crab, crocodile, cup,
+dinosaur, dolphin, elephant, flatfish, forest, fox, girl, hamster, house,
+kangaroo, keyboard, lamp, lawn_mower, leopard, lion, lizard, lobster, man,
+maple_tree, motorcycle, mountain, mouse, mushroom, oak_tree, orange, orchid,
+otter, palm_tree, pear, pickup_truck, pine_tree, plain, plate, poppy, porcupine,
+possum, rabbit, raccoon, ray, road, rocket, rose, sea, seal, shark, shrew,
+skunk, skyscraper, snail, snake, spider, squirrel, streetcar, sunflower,
+sweet_pepper, table, tank, telephone, television, tiger, tractor, train, trout,
+tulip, turtle, wardrobe, whale, willow_tree, wolf, woman, worm
+
+================================================================================
+FUNCTION: get_data_folder()
+================================================================================
+
+def get_data_folder():
+    """return the path to store the data"""
+    data_folder = '../data/'
+
+    if not os.path.isdir(data_folder):
+        os.makedirs(data_folder)
+
+    return data_folder
+
+PURPOSE: Returns path where CIFAR-100 will be downloaded/stored
+
+DEFAULT LOCATION: ../data/
+  If running from SimKD/, data stored in ../data/cifar-100-python/
+
+AUTO-DOWNLOAD:
+  torchvision.datasets.CIFAR100 automatically downloads if not present
+
+================================================================================
+DATA NORMALIZATION
+================================================================================
+
+MEAN: (0.5071, 0.4867, 0.4408)
+STD:  (0.2675, 0.2565, 0.2761)
+
+These are the channel-wise mean and standard deviation computed over the
+entire CIFAR-100 training set.
+
+NORMALIZATION FORMULA:
+  normalized_pixel = (original_pixel - mean) / std
+
+EXAMPLE:
+  Original RGB pixel: (130, 120, 110) in range [0, 255]
+  After ToTensor(): (0.510, 0.471, 0.431) in range [0, 1]
+  After Normalize():
+    R: (0.510 - 0.5071) / 0.2675 = 0.011
+    G: (0.471 - 0.4867) / 0.2565 = -0.061
+    B: (0.431 - 0.4408) / 0.2761 = -0.036
+
+  Result: Approximately zero-mean, unit-variance features
+
+WHY NORMALIZE?
+- Stabilizes training
+- Faster convergence
+- Better gradient flow
+- Standard practice for neural networks
+
+================================================================================
+CLASS: CIFAR100BackCompat
+================================================================================
+
+class CIFAR100BackCompat(datasets.CIFAR100):
+    @property
+    def train_labels(self):
+        return self.targets
+
+    @property
+    def test_labels(self):
+        return self.targets
+
+    @property
+    def train_data(self):
+        return self.data
+
+    @property
+    def test_data(self):
+        return self.data
+
+PURPOSE: Provides backward compatibility with older PyTorch versions
+
+CHANGES IN PYTORCH:
+  Old: dataset.train_labels, dataset.train_data
+  New: dataset.targets, dataset.data
+
+This class allows code to use either convention.
+
+================================================================================
+CLASS: CIFAR100Instance
+================================================================================
+
+class CIFAR100Instance(CIFAR100BackCompat):
+    """CIFAR100Instance Dataset."""
+    def __getitem__(self, index):
+        img, target = self.data[index], self.targets[index]
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target, index
+
+PURPOSE: Returns (image, label, index) instead of just (image, label)
+
+WHY INDEX?
+- Some methods need to track which sample is which
+- Useful for curriculum learning
+- Required for memory banks (CRD)
+
+USAGE:
+  dataset = CIFAR100Instance(root='../data/', train=True, transform=transforms)
+  img, label, idx = dataset[0]
+  # img: Transformed image tensor
+  # label: Class label (0-99)
+  # idx: 0 (position in dataset)
+
+================================================================================
+FUNCTION: get_cifar100_dataloaders()
+================================================================================
+
+def get_cifar100_dataloaders(batch_size=128, num_workers=8, is_instance=False):
+    """cifar 100"""
+    data_folder = get_data_folder()
+
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+
+    if is_instance:
+        train_set = CIFAR100Instance(root=data_folder, download=True,
+                                     train=True, transform=train_transform)
+        n_data = len(train_set)
+    else:
+        train_set = datasets.CIFAR100(root=data_folder, download=True,
+                                      train=True, transform=train_transform)
+
+    train_loader = DataLoader(train_set, batch_size=batch_size,
+                              shuffle=True, num_workers=num_workers,
+                              pin_memory=True)
+
+    test_set = datasets.CIFAR100(root=data_folder, download=True,
+                                 train=False, transform=test_transform)
+    test_loader = DataLoader(test_set, batch_size=int(batch_size/2),
+                             shuffle=False, num_workers=int(num_workers/2),
+                             pin_memory=True)
+
+    if is_instance:
+        return train_loader, test_loader, n_data
+    else:
+        return train_loader, test_loader
+
+PURPOSE: Standard CIFAR-100 data loaders
+
+PARAMETERS:
+- batch_size: Number of images per batch (default: 128)
+- num_workers: Parallel data loading processes (default: 8)
+- is_instance: Whether to return indices (default: False)
+
+RETURNS:
+- If is_instance=False: (train_loader, test_loader)
+- If is_instance=True: (train_loader, test_loader, n_data)
+
+TRAINING TRANSFORMS:
+1. RandomCrop(32, padding=4):
+   - Pads image to 36×36 (add 4 pixels on each side)
+   - Randomly crops back to 32×32
+   - Creates 5^2 = 25 possible crops
+   - DATA AUGMENTATION: Adds translation invariance
+
+2. RandomHorizontalFlip():
+   - 50% chance to flip image horizontally
+   - DATA AUGMENTATION: Adds reflection invariance
+
+3. ToTensor():
+   - Converts PIL Image to PyTorch tensor
+   - Changes range from [0, 255] to [0, 1]
+   - Changes shape from (H, W, C) to (C, H, W)
+
+4. Normalize():
+   - Standardizes to zero mean, unit variance
+
+TESTING TRANSFORMS:
+- Only ToTensor() and Normalize()
+- NO AUGMENTATION (for consistent evaluation)
+
+DATALOADER SETTINGS:
+  train_loader = DataLoader(
+      train_set,
+      batch_size=batch_size,    # Usually 64-128
+      shuffle=True,             # Randomize order each epoch
+      num_workers=num_workers,  # Parallel loading (usually 8)
+      pin_memory=True)          # Speeds up GPU transfer
+
+  test_loader = DataLoader(
+      test_set,
+      batch_size=int(batch_size/2),  # Smaller batch for inference
+      shuffle=False,                 # Sequential order
+      num_workers=int(num_workers/2), # Fewer workers needed
+      pin_memory=True)
+
+WHY SMALLER TEST BATCH?
+- Inference uses less memory (no gradients)
+- Can use larger batch, but not necessary
+- Consistent with common practice
+
+================================================================================
+CLASS: CIFAR100InstanceSample
+================================================================================
+
+class CIFAR100InstanceSample(CIFAR100BackCompat):
+    """CIFAR100Instance+Sample Dataset"""
+
+    def __init__(self, root, train=True, transform=None, target_transform=None,
+                 download=False, k=4096, mode='exact', is_sample=True, percent=1.0):
+        super().__init__(root=root, train=train, download=download,
+                         transform=transform, target_transform=target_transform)
+        self.k = k
+        self.mode = mode
+        self.is_sample = is_sample
+
+        num_classes = 100
+        num_samples = len(self.data)
+        label = self.targets
+
+        # Build positive sample indices (same class)
+        self.cls_positive = [[] for i in range(num_classes)]
+        for i in range(num_samples):
+            self.cls_positive[label[i]].append(i)
+
+        # Build negative sample indices (different class)
+        self.cls_negative = [[] for i in range(num_classes)]
+        for i in range(num_classes):
+            for j in range(num_classes):
+                if j == i:
+                    continue
+                self.cls_negative[i].extend(self.cls_positive[j])
+
+        self.cls_positive = [np.asarray(self.cls_positive[i]) for i in range(num_classes)]
+        self.cls_negative = [np.asarray(self.cls_negative[i]) for i in range(num_classes)]
+
+        # Subsample negatives if percent < 1
+        if 0 < percent < 1:
+            n = int(len(self.cls_negative[0]) * percent)
+            self.cls_negative = [np.random.permutation(self.cls_negative[i])[0:n]
+                                 for i in range(num_classes)]
+
+        self.cls_positive = np.asarray(self.cls_positive)
+        self.cls_negative = np.asarray(self.cls_negative)
+
+PURPOSE: Provides contrastive samples for CRD method
+
+DATA STRUCTURE:
+  cls_positive[c]: List of indices for class c
+  cls_negative[c]: List of indices for all classes except c
+
+EXAMPLE:
+  Class 0 (apple): indices [0, 501, 1002, ...]  (500 total)
+  Class 1 (fish): indices [1, 502, 1003, ...]
+  ...
+
+  cls_positive[0] = [0, 501, 1002, ...]  # All apples
+  cls_negative[0] = [1, 502, 1003, ...] + [2, 503, ...] + ...  # All non-apples
+
+PARAMETERS:
+- k: Number of negative samples (default: 4096)
+- mode: 'exact' or 'relax'
+  - 'exact': Positive sample is the sample itself
+  - 'relax': Positive sample is random same-class sample
+- is_sample: Whether to return contrastive samples
+- percent: Fraction of negatives to use (for memory efficiency)
+
+__getitem__ METHOD:
+  def __getitem__(self, index):
+      img, target = self.data[index], self.targets[index]
+      img = Image.fromarray(img)
+
+      if self.transform is not None:
+          img = self.transform(img)
+
+      if self.target_transform is not None:
+          target = self.target_transform(target)
+
+      if not self.is_sample:
+          return img, target, index
+      else:
+          if self.mode == 'exact':
+              pos_idx = index
+          elif self.mode == 'relax':
+              pos_idx = np.random.choice(self.cls_positive[target], 1)[0]
+
+          replace = True if self.k > len(self.cls_negative[target]) else False
+          neg_idx = np.random.choice(self.cls_negative[target], self.k, replace=replace)
+          sample_idx = np.hstack((np.asarray([pos_idx]), neg_idx))
+          return img, target, index, sample_idx
+
+RETURNS:
+  (img, target, index, sample_idx)
+
+  - img: Transformed image [3, 32, 32]
+  - target: Class label (0-99)
+  - index: Position in dataset
+  - sample_idx: [k+1] array
+    - sample_idx[0]: Positive sample index
+    - sample_idx[1:]: k negative sample indices
+
+EXAMPLE:
+  index = 100 (class 5, "butterfly")
+  target = 5
+
+  pos_idx = 100 (same sample, mode='exact')
+  neg_idx = [23, 456, 789, ...] (k=4096 samples from other classes)
+  sample_idx = [100, 23, 456, 789, ...]
+
+WHY CONTRASTIVE SAMPLING?
+CRD method uses NCE (Noise Contrastive Estimation) loss:
+- Pull positive pairs together in feature space
+- Push negative pairs apart
+- Requires explicit positive/negative samples
+
+================================================================================
+FUNCTION: get_cifar100_dataloaders_sample()
+================================================================================
+
+def get_cifar100_dataloaders_sample(batch_size=128, num_workers=8, k=4096,
+                                    mode='exact', is_sample=True, percent=1.0):
+    """cifar 100"""
+    data_folder = get_data_folder()
+
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+
+    train_set = CIFAR100InstanceSample(root=data_folder, download=True,
+                                       train=True, transform=train_transform,
+                                       k=k, mode=mode, is_sample=is_sample,
+                                       percent=percent)
+    n_data = len(train_set)
+    train_loader = DataLoader(train_set, batch_size=batch_size,
+                              shuffle=True, num_workers=num_workers,
+                              pin_memory=True)
+
+    test_set = datasets.CIFAR100(root=data_folder, download=True,
+                                 train=False, transform=test_transform)
+    test_loader = DataLoader(test_set, batch_size=int(batch_size/2),
+                             shuffle=False, num_workers=int(num_workers/2),
+                             pin_memory=True)
+
+    return train_loader, test_loader, n_data
+
+PURPOSE: Data loaders with contrastive sampling for CRD
+
+USAGE IN train_student.py:
+  if opt.distill in ['crd']:
+      train_loader, val_loader, n_data = get_cifar100_dataloaders_sample(
+          batch_size=opt.batch_size,
+          num_workers=opt.num_workers,
+          k=opt.nce_k,
+          mode=opt.mode)
+
+TYPICAL SETTINGS:
+  k = 16384  # Large number of negatives
+  mode = 'exact'  # Use same sample as positive
+  is_sample = True  # Return contrastive samples
+  percent = 1.0  # Use all negatives
+
+BATCH STRUCTURE:
+  for images, labels, indices, sample_indices in train_loader:
+      # images: [B, 3, 32, 32]
+      # labels: [B]
+      # indices: [B]
+      # sample_indices: [B, k+1]
+
+MEMORY CONSIDERATION:
+  sample_indices: [64, 16385] = ~1M integers = 4MB per batch
+  Not too large, but noticeable.
+
+================================================================================
+DATA AUGMENTATION VISUALIZATION
+================================================================================
+
+ORIGINAL IMAGE: 32×32 cat
+
+AFTER PADDING (36×36):
+  ┌────────────────────┐
+  │  (padded border)   │
+  │  ┌──────────────┐  │
+  │  │              │  │
+  │  │  cat image   │  │
+  │  │              │  │
+  │  └──────────────┘  │
+  │  (padded border)   │
+  └────────────────────┘
+
+AFTER RANDOM CROP (back to 32×32):
+  Randomly select 32×32 region from 36×36
+  Possible outcomes:
+  - Top-left crop
+  - Center crop
+  - Bottom-right crop
+  - ... 25 different positions
+
+AFTER RANDOM HORIZONTAL FLIP:
+  50% chance:
+  Original: 😺 →
+  Flipped:  ← 😺
+
+RESULT:
+  Each epoch, same image appears with different:
+  - Position (due to random crop)
+  - Orientation (due to random flip)
+
+  Effectively multiplies training data by ~50x!
+
+================================================================================
+TYPICAL USAGE
+================================================================================
+
+STANDARD TRAINING:
+  train_loader, val_loader = get_cifar100_dataloaders(
+      batch_size=64,
+      num_workers=8)
+
+  for epoch in range(epochs):
+      for images, labels in train_loader:
+          # Training code
+          pass
+
+CRD TRAINING:
+  train_loader, val_loader, n_data = get_cifar100_dataloaders_sample(
+      batch_size=64,
+      num_workers=8,
+      k=16384,
+      mode='exact')
+
+  for epoch in range(epochs):
+      for images, labels, indices, sample_idx in train_loader:
+          # CRD training code
+          pass
+
+================================================================================
+END OF dataset/cifar100.py EXPLANATION
+================================================================================

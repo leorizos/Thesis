@@ -1,0 +1,427 @@
+---
+helper/util.py - UTILITY FUNCTIONS
+---
+
+PURPOSE:
+Provides essential utility functions for training: learning rate scheduling,
+metric tracking, accuracy computation, file I/O, and distributed training support.
+
+---
+FUNCTION: adjust_learning_rate()
+---
+
+def adjust_learning_rate(epoch, opt, optimizer):
+    """Sets the learning rate to the initial LR decayed by decay rate every steep step"""
+    steps = np.sum(epoch > np.asarray(opt.lr_decay_epochs))
+    if steps > 0:
+        new_lr = opt.learning_rate * (opt.lr_decay_rate ** steps)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lr
+
+PURPOSE: Implements step-wise learning rate decay
+
+EXAMPLE:
+  opt.learning_rate = 0.05
+  opt.lr_decay_epochs = [150, 180, 210]
+  opt.lr_decay_rate = 0.1
+
+  Epoch 1-149:   LR = 0.05 * (0.1^0) = 0.05
+  Epoch 150-179: LR = 0.05 * (0.1^1) = 0.005
+  Epoch 180-209: LR = 0.05 * (0.1^2) = 0.0005
+  Epoch 210+:    LR = 0.05 * (0.1^3) = 0.00005
+
+HOW IT WORKS:
+  steps = np.sum(epoch > np.asarray([150, 180, 210]))
+
+  Epoch 100: steps = sum([False, False, False]) = 0
+  Epoch 150: steps = sum([False, False, False]) = 0  # Not greater!
+  Epoch 151: steps = sum([True, False, False]) = 1
+  Epoch 180: steps = sum([True, False, False]) = 1
+  Epoch 181: steps = sum([True, True, False]) = 2
+  Epoch 211: steps = sum([True, True, True]) = 3
+
+  new_lr = 0.05 * (0.1 ** steps)
+
+UPDATES ALL PARAMETER GROUPS:
+  for param_group in optimizer.param_groups:
+      param_group['lr'] = new_lr
+
+  Handles different learning rates for different layers (if configured)
+
+---
+CLASS: AverageMeter
+---
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+PURPOSE: Tracks running averages efficiently
+
+ATTRIBUTES:
+- val: Most recent value
+- avg: Current average (sum / count)
+- sum: Cumulative sum of all values
+- count: Number of values added
+
+USAGE:
+  losses = AverageMeter()
+
+  for batch in data_loader:
+      loss = compute_loss(batch)
+      losses.update(loss.item(), batch_size)
+
+  print(f"Average loss: {losses.avg}")
+
+WHY n PARAMETER?
+  Different batches may have different sizes.
+  Last batch might be smaller if dataset size not divisible by batch_size.
+
+  update(loss=2.5, n=64)  # Full batch
+  update(loss=2.3, n=32)  # Partial last batch
+
+  Correctly weights the average.
+
+---
+FUNCTION: accuracy()
+---
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+PURPOSE: Computes top-k accuracy
+
+INPUTS:
+- output: Model predictions [B, num_classes]
+- target: True labels [B]
+- topk: Tuple of k values (default: (1,))
+
+OUTPUTS:
+- List of accuracies (as percentages) for each k
+
+EXAMPLE:
+  output = [[0.1, 0.8, 0.05, 0.05],   # Pred: [1, 0, 2, 3]
+            [0.3, 0.2, 0.4, 0.1],     # Pred: [2, 0, 1, 3]
+            [0.5, 0.3, 0.1, 0.1]]     # Pred: [0, 1, 2, 3]
+  target = [1, 2, 0]
+
+  acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+STEP-BY-STEP:
+1. Get top-k predictions:
+   _, pred = output.topk(5, dim=1, largest=True, sorted=True)
+   pred = [[1, 0, 2, 3, ...],
+           [2, 0, 1, 3, ...],
+           [0, 1, 2, 3, ...]]
+
+2. Transpose:
+   pred = pred.t()  # Shape [5, 3]
+   pred = [[1, 2, 0],  # Top-1 for each sample
+           [0, 0, 1],  # Top-2
+           [2, 1, 2],  # Top-3
+           [3, 3, 3],  # Top-4
+           ...]        # Top-5
+
+3. Check correctness:
+   target = [1, 2, 0]
+   correct = pred.eq(target)
+   correct = [[True, True, True],   # Top-1: all correct!
+              [False, False, False], # Top-2: none match
+              [False, False, False], # Top-3: none match
+              ...]
+
+4. Compute top-1 accuracy:
+   correct[:1] = [[True, True, True]]
+   sum = 3
+   accuracy = (3 / 3) * 100 = 100.0%
+
+5. Compute top-5 accuracy:
+   correct[:5] includes all rows
+   At least one True in each column → 100.0%
+
+---
+FUNCTION: save_dict_to_json()
+---
+
+def save_dict_to_json(d, json_path):
+    """Saves dict of floats in json file"""
+    with open(json_path, 'w') as f:
+        d = {k: v for k, v in d.items()}
+        json.dump(d, f, indent=4)
+
+PURPOSE: Saves configuration and metrics to human-readable JSON
+
+USAGE:
+  metrics = {
+      'test_loss': 0.845,
+      'test_acc': 72.34,
+      'test_acc_top5': 94.12,
+      'epoch': 235
+  }
+  save_dict_to_json(metrics, 'test_best_metrics.json')
+
+OUTPUT FILE:
+  {
+      "test_loss": 0.845,
+      "test_acc": 72.34,
+      "test_acc_top5": 94.12,
+      "epoch": 235
+  }
+
+indent=4: Pretty-printing for readability
+
+---
+FUNCTION: load_json_to_dict()
+---
+
+def load_json_to_dict(json_path):
+    """Loads json file to dict"""
+    with open(json_path, 'r') as f:
+        params = json.load(f)
+    return params
+
+PURPOSE: Loads saved configurations
+
+USAGE:
+  params = load_json_to_dict('parameters.json')
+  print(f"Model: {params['model']}")
+  print(f"Best accuracy: {params['best_acc']}")
+
+---
+FUNCTION: reduce_tensor()
+---
+
+def reduce_tensor(tensor, world_size=1, op='avg'):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    if world_size > 1:
+        rt = torch.true_divide(rt, world_size)
+    return rt
+
+PURPOSE: Aggregates tensors across multiple GPUs in distributed training
+
+HOW IT WORKS:
+
+Single GPU (world_size=1):
+  tensor = [10.0]
+  result = [10.0]  # No change
+
+Multiple GPUs (world_size=4):
+  GPU 0: tensor = [10.0]
+  GPU 1: tensor = [12.0]
+  GPU 2: tensor = [11.0]
+  GPU 3: tensor = [9.0]
+
+  After all_reduce (SUM):
+  All GPUs: rt = [42.0]  # 10+12+11+9
+
+  After division by world_size:
+  All GPUs: rt = [10.5]  # 42/4
+
+USAGE IN VALIDATION:
+  # Each GPU computes metrics on its portion of data
+  GPU 0: total = 750 correct, count = 1000 samples
+  GPU 1: total = 720 correct, count = 1000 samples
+  GPU 2: total = 740 correct, count = 1000 samples
+  GPU 3: total = 730 correct, count = 1000 samples
+
+  # Aggregate
+  total_metrics = torch.tensor([750, 720, 740, 730])
+  total_sum = reduce_tensor(total_metrics, world_size=1)  # Sum, not average!
+  # total_sum = 2940
+
+  count_metrics = torch.tensor([1000, 1000, 1000, 1000])
+  count_sum = reduce_tensor(count_metrics, world_size=1)
+  # count_sum = 4000
+
+  # Accuracy
+  accuracy = total_sum / count_sum = 2940 / 4000 = 73.5%
+
+WHY world_size=1 FOR SUMS?
+  We want TOTAL sum across GPUs, not average.
+  Setting world_size=1 skips the division.
+
+---
+TYPICAL WORKFLOW
+---
+
+TRAINING SETUP:
+  # Create optimizer
+  optimizer = optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+
+  # Create meters
+  losses = AverageMeter()
+  top1 = AverageMeter()
+  top5 = AverageMeter()
+
+TRAINING LOOP:
+  for epoch in range(1, epochs + 1):
+      # Adjust learning rate
+      adjust_learning_rate(epoch, opt, optimizer)
+
+      # Reset meters
+      losses.reset()
+      top1.reset()
+      top5.reset()
+
+      for images, labels in train_loader:
+          # Forward
+          output = model(images)
+          loss = criterion(output, labels)
+
+          # Metrics
+          acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+          losses.update(loss.item(), images.size(0))
+          top1.update(acc1.item(), images.size(0))
+          top5.update(acc5.item(), images.size(0))
+
+          # Backward
+          optimizer.zero_grad()
+          loss.backward()
+          optimizer.step()
+
+      # Log epoch metrics
+      print(f"Epoch {epoch}: Loss={losses.avg:.4f}, "
+            f"Acc@1={top1.avg:.3f}, Acc@5={top5.avg:.3f}")
+
+SAVING:
+  # Save best model
+  state = {
+      'epoch': epoch,
+      'model': model.state_dict(),
+      'best_acc': top1.avg
+  }
+  torch.save(state, 'best_model.pth')
+
+  # Save metrics
+  metrics = {
+      'test_loss': losses.avg,
+      'test_acc': top1.avg,
+      'test_acc_top5': top5.avg
+  }
+  save_dict_to_json(metrics, 'metrics.json')
+
+  # Save config
+  config = {
+      'model': 'resnet32x4',
+      'learning_rate': 0.05,
+      'batch_size': 64,
+      'Total params': 2.76
+  }
+  save_dict_to_json(config, 'config.json')
+
+---
+DISTRIBUTED TRAINING EXAMPLE
+---
+
+SETUP (in main_worker):
+  if opt.multiprocessing_distributed:
+      dist.init_process_group(...)
+      opt.world_size = ngpus_per_node
+
+TRAINING (same as before):
+  train_acc = train_function(...)
+
+AGGREGATION:
+  if opt.multiprocessing_distributed:
+      metrics = torch.tensor([train_acc, train_loss]).cuda(opt.gpu)
+      reduced = reduce_tensor(metrics, opt.world_size)
+      train_acc, train_loss = reduced.tolist()
+
+  Now train_acc and train_loss are averaged across all GPUs.
+
+SAVING (only on rank 0):
+  if not opt.multiprocessing_distributed or opt.rank == 0:
+      save_model(...)
+      save_dict_to_json(...)
+
+  Prevents multiple processes from writing same file.
+
+---
+NUMERICAL PRECISION
+---
+
+FLOAT PRECISION:
+  Python float: 64-bit
+  PyTorch default: 32-bit (torch.float32)
+
+WHEN CONVERTING:
+  loss.item(): Converts tensor to Python float (64-bit)
+
+ACCURACY IN JSON:
+  metrics = {
+      'test_acc': float('%.2f' % test_acc)  # Round to 2 decimals
+  }
+
+  Saves: 72.34 instead of 72.3456789
+
+---
+COMMON PITFALLS
+---
+
+1. FORGETTING TO RESET METERS:
+   BAD:
+     losses = AverageMeter()
+     for epoch in range(epochs):
+         for batch in train_loader:
+             losses.update(...)
+         # losses.avg is average over ALL epochs, not just this one!
+
+   GOOD:
+     losses = AverageMeter()
+     for epoch in range(epochs):
+         losses.reset()  # Reset each epoch
+         for batch in train_loader:
+             losses.update(...)
+
+2. WRONG UPDATE SIZE:
+   BAD:
+     losses.update(loss.item())  # Assumes n=1
+
+   GOOD:
+     losses.update(loss.item(), images.size(0))  # Correct batch size
+
+3. ACCESSING .item() ON MULTI-ELEMENT TENSOR:
+   BAD:
+     losses.update(losses_tensor)  # Can't convert multi-element tensor
+
+   GOOD:
+     losses.update(losses_tensor.item())  # Convert to scalar first
+
+4. DISTRIBUTED REDUCE WITHOUT PROPER world_size:
+   BAD:
+     total = reduce_tensor(tensor, world_size=4)  # Divides by 4
+     # But we want sum!
+
+   GOOD:
+     total = reduce_tensor(tensor, world_size=1)  # No division
+
+---
+END OF helper/util.py EXPLANATION
+---
