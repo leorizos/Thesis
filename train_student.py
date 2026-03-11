@@ -84,6 +84,9 @@ def parse_option():
     # GCN (learnable confusion matrix for Soft AKD)
     parser.add_argument('--alpha_soft', type=float, default=0.1, help='Soft AKD: GCN blending weight (0 = original sigma, 1 = full GCN)')
     parser.add_argument('--gcn_lr', type=float, default=1e-4, help='Soft AKD: learning rate for GCN')
+    parser.add_argument('--no_gcn', action='store_true', help='Soft AKD: disable GCN softening (use raw sigma only)')
+    parser.add_argument('--lambda_mode', type=str, default='cw', choices=['cw', 'rw'],
+                        help='Soft AKD: lambda computation mode. cw=cell-wise sigmoid (default), rw=row-wise Pearson')
     parser.add_argument('--sigma_s_mode', type=str, default='ab', choices=['ab', 'aa', 'bb'],
                         help='Soft AKD: how to compute Sigma_s for GCN training. '
                              'ab=batch-to-anchor (default), aa=anchor-to-anchor, bb=batch-to-batch')
@@ -138,7 +141,11 @@ def parse_option():
     opt.model_name = model_name_template.format(opt.model_s, opt.model_t, opt.dataset, opt.distill,
                                                 opt.cls, opt.div, opt.beta, opt.trial)
     if opt.distill == 'soft_akd':
-        opt.model_name += '_l_{}_a_{}_glr_{}'.format(opt.lambda_soft, opt.alpha_soft, opt.gcn_lr)
+        lm = getattr(opt, 'lambda_mode', 'cw')
+        if getattr(opt, 'no_gcn', False):
+            opt.model_name += '_l_{}_{}_nogcn'.format(opt.lambda_soft, lm)
+        else:
+            opt.model_name += '_l_{}_{}_a_{}_glr_{}'.format(opt.lambda_soft, lm, opt.alpha_soft, opt.gcn_lr)
         if opt.sigma_temp != 1.0:
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
         if opt.sigma_s_mode != 'ab':
@@ -505,13 +512,16 @@ def main_worker(gpu, ngpus_per_node, opt):
             sigma = torch.from_numpy(sigma_np).float().cuda(gpu_device)
             # anchors_per_class=1, selected in class order → anchor i = class i
             anchor_labels = torch.arange(n_cls).cuda(gpu_device)
-            gcn = GCN(num_classes=n_cls).cuda(gpu_device)
-            optimizer_gcn = torch.optim.Adam(gcn.parameters(), lr=opt.gcn_lr)
             print(f'    Soft AKD: sigma loaded from {opt.sigma_path}')
             print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
             print(f'    Soft AKD: sigma_temp = {opt.sigma_temp}')
-            print(f'    Soft AKD: GCN initialised ({n_cls}x{n_cls})')
-            print(f'    Soft AKD: GCN lr = {opt.gcn_lr}, alpha_soft = {opt.alpha_soft}')
+            if not getattr(opt, 'no_gcn', False):
+                gcn = GCN(num_classes=n_cls).cuda(gpu_device)
+                optimizer_gcn = torch.optim.Adam(gcn.parameters(), lr=opt.gcn_lr)
+                print(f'    Soft AKD: GCN initialised ({n_cls}x{n_cls})')
+                print(f'    Soft AKD: GCN lr = {opt.gcn_lr}, alpha_soft = {opt.alpha_soft}')
+            else:
+                print(f'    Soft AKD: GCN disabled (--no_gcn), using raw sigma only')
 
     # GCN diagnostic collectors (only used when distill == 'soft_akd' with GCN)
     gcn_snapshot_store = {} if (opt.distill == 'soft_akd' and gcn is not None) else None

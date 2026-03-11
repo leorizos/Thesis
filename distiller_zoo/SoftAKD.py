@@ -101,7 +101,7 @@ def pearson_distance_rows(P, Q, eps=1e-7):
     return 1.0 - F.cosine_similarity(P_c, Q_c, dim=1, eps=eps)  # [N]
 
 
-def adaptive_lambda(disagreement, lambda_soft, k=10.0, d0=0.5, eps=1e-7):
+def adaptive_lambda(disagreement, lambda_soft, k=10.0, d0=0.3, eps=1e-7):
     """
     Per-sample lambda via sigmoid gate on normalised Pearson disagreement.
 
@@ -122,6 +122,30 @@ def adaptive_lambda(disagreement, lambda_soft, k=10.0, d0=0.5, eps=1e-7):
     disagreement_norm = disagreement / (disagreement.max() + eps)
     gate = torch.sigmoid(k * (disagreement_norm - d0))
     return 1.0 - gate * (1.0 - lambda_soft)  # [N]
+
+
+def cell_wise_lambda(T_sim, S_sim, lambda_soft, k=10.0, d0=0.3):
+    """
+    Cell-wise lambda matrix via sigmoid gate on absolute disagreement.
+
+    When teacher and student agree on a cell → lambda ≈ 1.0 (pure AKD).
+    When they disagree strongly on a cell → lambda → lambda_soft (blend in more sigma).
+
+        disagreement = |T_sim - S_sim|             (already in [0, 1])
+        gate         = sigmoid(k * (disagreement - d0))
+        lambda       = 1.0 - gate * (1.0 - lambda_soft)   ∈ [lambda_soft, 1.0]
+
+    Args:
+        T_sim, S_sim: tensors of same shape, values in [0, 1]
+        lambda_soft:  scalar floor value
+        k:            sigmoid steepness (default 10.0)
+        d0:           sigmoid midpoint (default 0.3)
+    Returns:
+        lambda matrix of same shape as inputs
+    """
+    disagreement = (T_sim - S_sim).abs()
+    gate = torch.sigmoid(k * (disagreement - d0))
+    return 1.0 - gate * (1.0 - lambda_soft)
 
 
 def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
@@ -175,15 +199,24 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         sigma_ba = sigma_ba ** exponent
         sigma_ab = sigma_ab ** exponent
 
-    lambda_k  = getattr(opt, 'lambda_k',  10.0)
-    lambda_d0 = getattr(opt, 'lambda_d0', 0.5)
+    lambda_k    = getattr(opt, 'lambda_k',    10.0)
+    lambda_d0   = getattr(opt, 'lambda_d0',   0.3)
+    lambda_mode = getattr(opt, 'lambda_mode', 'cw')
 
-    lam_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
-                             lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
-    lam_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
-                             lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
-    lam_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
-                             lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [A, 1]
+    if lambda_mode == 'rw':
+        lam_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
+                                 lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
+        lam_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
+                                 lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
+        lam_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
+                                 lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [A, 1]
+    else:  # 'cw'
+        lam_L1 = cell_wise_lambda(b_teacher_sim, b_student_sim,
+                                  lambda_soft, lambda_k, lambda_d0)   # [B, B]
+        lam_L2 = cell_wise_lambda(a_teacher_sim, a_student_sim,
+                                  lambda_soft, lambda_k, lambda_d0)   # [B, A]
+        lam_L3 = cell_wise_lambda(a_teacher_sim_t, a_student_sim_t,
+                                  lambda_soft, lambda_k, lambda_d0)   # [A, B]
 
     b_teacher_sim   = lam_L1 * b_teacher_sim   + (1 - lam_L1) * sigma_bb
     a_teacher_sim   = lam_L2 * a_teacher_sim   + (1 - lam_L2) * sigma_ba
