@@ -28,7 +28,7 @@ def soften_sigma_with_gcn(sigma, target_net, output_net, anchor_target, anchor_n
     2. loss_G = MSE(Σ_t_hat, Σ_s) where Σ_s = student's class-level patterns
 
     sigma_s_mode controls how Σ_s is computed:
-        'ab' (default) — batch-to-anchor: sim(batch_class_i, anchor_class_j) [B, A] → [C, C]
+        'ab' (default) — merged batch+anchor: sim(batch+anchor, batch+anchor) [B+A, B+A] → [C, C], 100% class coverage
         'aa'           — anchor-to-anchor: sim(anchor_i, anchor_j)           [A, A] → [C, C]
         'bb'           — batch-to-batch:   sim(batch_class_i, batch_class_j) [B, B] → [C, C]
     """
@@ -40,10 +40,12 @@ def soften_sigma_with_gcn(sigma, target_net, output_net, anchor_target, anchor_n
     anchor_net = F.normalize(anchor_net, p=2, dim=1)   # [A, D]
 
     if sigma_s_mode == 'ab':
-        # Similarity between batch samples and anchors [B, A]
-        sim = (torch.mm(output_net, anchor_net.t()) + 1) / 2
-        row_labels = labels          # [B]
-        col_labels = anchor_labels   # [A]
+        # Merged batch+anchor features [B+A, D], 100% class coverage
+        merged = torch.cat([output_net, anchor_net], dim=0)          # [B+A, D]
+        merged_labels = torch.cat([labels, anchor_labels], dim=0)    # [B+A]
+        sim = (torch.mm(merged, merged.t()) + 1) / 2                 # [B+A, B+A]
+        row_labels = merged_labels
+        col_labels = merged_labels
 
     elif sigma_s_mode == 'aa':
         # Similarity between anchors and anchors [A, A]
