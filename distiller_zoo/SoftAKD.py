@@ -103,51 +103,51 @@ def pearson_distance_rows(P, Q, eps=1e-7):
     return 1.0 - F.cosine_similarity(P_c, Q_c, dim=1, eps=eps)  # [N]
 
 
-def adaptive_lambda(disagreement, lambda_soft, k=10.0, d0=0.3, eps=1e-7):
+def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7):
     """
-    Per-sample lambda via sigmoid gate on normalised Pearson disagreement.
+    Per-sample sigma weight via sigmoid gate on normalised Pearson disagreement.
 
-    When teacher and student agree (low disagreement) → lambda ≈ 1.0 (pure AKD).
-    When they disagree strongly → lambda → lambda_soft (blend in more sigma).
+    When teacher and student agree (low disagreement) → sigma weight ≈ 0.0 (pure teacher).
+    When they disagree strongly → sigma weight → lambda_max.
 
-        gate = sigmoid(k * (d_norm - d0))
-        lambda = 1.0 - gate * (1.0 - lambda_soft)   ∈ [lambda_soft, 1.0]
+        gate   = sigmoid(k * (d_norm - d0))
+        lambda = gate * lambda_max   ∈ [0, lambda_max]
 
     Args:
         disagreement: [N] Pearson distances (unnormalized)
-        lambda_soft:  scalar floor value
+        lambda_max:   scalar ceiling for sigma weight (e.g. 0.3 → max 30% sigma)
         k:            sigmoid steepness (default 10.0)
-        d0:           sigmoid midpoint on normalized scale (default 0.5)
+        d0:           sigmoid midpoint on normalized scale (default 0.3)
     Returns:
-        [N] per-sample lambda values
+        [N] per-sample sigma weight values
     """
     disagreement_norm = disagreement / (disagreement.max() + eps)
     gate = torch.sigmoid(k * (disagreement_norm - d0))
-    return 1.0 - gate * (1.0 - lambda_soft)  # [N]
+    return gate * lambda_max  # [N]
 
 
-def cell_wise_lambda(T_sim, S_sim, lambda_soft, k=10.0, d0=0.3):
+def cell_wise_lambda(T_sim, S_sim, lambda_max, k=10.0, d0=0.3):
     """
-    Cell-wise lambda matrix via sigmoid gate on absolute disagreement.
+    Cell-wise sigma weight matrix via sigmoid gate on absolute disagreement.
 
-    When teacher and student agree on a cell → lambda ≈ 1.0 (pure AKD).
-    When they disagree strongly on a cell → lambda → lambda_soft (blend in more sigma).
+    When teacher and student agree on a cell → sigma weight ≈ 0.0 (pure teacher).
+    When they disagree strongly on a cell → sigma weight → lambda_max.
 
         disagreement = |T_sim - S_sim|             (already in [0, 1])
         gate         = sigmoid(k * (disagreement - d0))
-        lambda       = 1.0 - gate * (1.0 - lambda_soft)   ∈ [lambda_soft, 1.0]
+        lambda       = gate * lambda_max            ∈ [0, lambda_max]
 
     Args:
         T_sim, S_sim: tensors of same shape, values in [0, 1]
-        lambda_soft:  scalar floor value
+        lambda_max:   scalar ceiling for sigma weight (e.g. 0.3 → max 30% sigma)
         k:            sigmoid steepness (default 10.0)
         d0:           sigmoid midpoint (default 0.3)
     Returns:
-        lambda matrix of same shape as inputs
+        sigma weight matrix of same shape as inputs
     """
     disagreement = (T_sim - S_sim).abs()
     gate = torch.sigmoid(k * (disagreement - d0))
-    return 1.0 - gate * (1.0 - lambda_soft)
+    return gate * lambda_max
 
 
 def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
@@ -160,7 +160,7 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     semantic structure into all three KL divergence terms.
 
         sigma_sharp = sigma_subset ^ (1 / sigma_temp)   (temperature sharpening)
-        S_teacher_soft = lambda * S_teacher + (1 - lambda) * sigma_sharp
+        S_teacher_soft = (1 - lambda) * S_teacher + lambda * sigma_sharp
 
     Args:
         target_net:    teacher pooled features for the batch          [B, D]
@@ -170,7 +170,7 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         labels:        batch class labels                             [B]
         anchor_labels: anchor class labels                            [A]
         sigma:         precomputed class similarity matrix             [C, C]
-        lambda_soft:   blending weight (1.0 = pure AKD, 0.0 = pure class-level)
+        lambda_soft:   max sigma weight (0.0 = pure teacher, 1.0 = pure sigma)
         opt:           options containing l_1, l_2, and sigma_temp hyperparameters
         eps:           small constant for numerical stability
     """
@@ -203,7 +203,7 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
 
     lambda_k    = getattr(opt, 'lambda_k',    10.0)
     lambda_d0   = getattr(opt, 'lambda_d0',   0.3)
-    lambda_mode = getattr(opt, 'lambda_mode', 'cw')
+    lambda_mode = getattr(opt, 'lambda_mode', 'rw')
 
     if lambda_mode == 'rw':
         lam_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
@@ -220,9 +220,9 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         lam_L3 = cell_wise_lambda(a_teacher_sim_t, a_student_sim_t,
                                   lambda_soft, lambda_k, lambda_d0)   # [A, B]
 
-    b_teacher_sim   = lam_L1 * b_teacher_sim   + (1 - lam_L1) * sigma_bb
-    a_teacher_sim   = lam_L2 * a_teacher_sim   + (1 - lam_L2) * sigma_ba
-    a_teacher_sim_t = lam_L3 * a_teacher_sim_t + (1 - lam_L3) * sigma_ab
+    b_teacher_sim   = (1 - lam_L1) * b_teacher_sim   + lam_L1 * sigma_bb
+    a_teacher_sim   = (1 - lam_L2) * a_teacher_sim   + lam_L2 * sigma_ba
+    a_teacher_sim_t = (1 - lam_L3) * a_teacher_sim_t + lam_L3 * sigma_ab
 
     # Normalize to probability distributions
     a_student_sim = a_student_sim / torch.sum(a_student_sim, dim=1, keepdim=True)

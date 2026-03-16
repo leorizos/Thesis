@@ -71,7 +71,7 @@ def parse_option():
     parser.add_argument('-s', '--soft', type=float, default=1.0, help='attention scale of SemCKD')
 
     # soft PKT v2
-    parser.add_argument('--lambda_soft', type=float, default=0.7, help='blending weight for soft PKT v2 (lambda)')
+    parser.add_argument('--lambda_soft', type=float, default=0.3, help='Soft AKD: max sigma weight (0.0 = pure teacher, 1.0 = pure sigma)')
     parser.add_argument('--sigma_temp', type=float, default=1.0, help='temperature for sharpening sigma (< 1.0 sharpens)')
     parser.add_argument('--sigma_path', type=str, default='save/class_similarity_matrix.npy',
                         help='path to class similarity matrix for soft PKT v2')
@@ -85,7 +85,7 @@ def parse_option():
     parser.add_argument('--alpha_soft', type=float, default=0.1, help='Soft AKD: GCN blending weight (0 = original sigma, 1 = full GCN)')
     parser.add_argument('--gcn_lr', type=float, default=1e-4, help='Soft AKD: learning rate for GCN')
     parser.add_argument('--no_gcn', action='store_true', help='Soft AKD: disable GCN softening (use raw sigma only)')
-    parser.add_argument('--lambda_mode', type=str, default='cw', choices=['cw', 'rw'],
+    parser.add_argument('--lambda_mode', type=str, default='rw', choices=['cw', 'rw'],
                         help='Soft AKD: lambda computation mode. cw=cell-wise sigmoid (default), rw=row-wise Pearson')
     parser.add_argument('--sigma_s_mode', type=str, default='ab', choices=['ab', 'aa', 'bb'],
                         help='Soft AKD: how to compute Sigma_s for GCN training. '
