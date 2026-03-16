@@ -121,8 +121,12 @@ def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7):
     Returns:
         [N] per-sample sigma weight values
     """
-    disagreement_norm = disagreement / (disagreement.max() + eps)
-    gate = torch.sigmoid(k * (disagreement_norm - d0))
+    if d0 == 'ma':
+        midpoint = disagreement.mean()
+    else:
+        disagreement = disagreement / (disagreement.max() + eps)
+        midpoint = d0
+    gate = torch.sigmoid(k * (disagreement - midpoint))
     return gate * lambda_max  # [N]
 
 
@@ -146,7 +150,11 @@ def cell_wise_lambda(T_sim, S_sim, lambda_max, k=10.0, d0=0.3):
         sigma weight matrix of same shape as inputs
     """
     disagreement = (T_sim - S_sim).abs()
-    gate = torch.sigmoid(k * (disagreement - d0))
+    if d0 == 'ma':
+        midpoint = disagreement.mean()
+    else:
+        midpoint = d0
+    gate = torch.sigmoid(k * (disagreement - midpoint))
     return gate * lambda_max
 
 

@@ -92,8 +92,8 @@ def parse_option():
                              'ab=batch-to-anchor (default), aa=anchor-to-anchor, bb=batch-to-batch')
     parser.add_argument('--lambda_k', type=float, default=10.0,
                         help='Soft AKD adaptive lambda: sigmoid steepness (default 10.0)')
-    parser.add_argument('--lambda_d0', type=float, default=0.3,
-                        help='Soft AKD adaptive lambda: sigmoid midpoint on normalised disagreement (default 0.5)')
+    parser.add_argument('--lambda_d0', type=lambda x: x if x == 'ma' else float(x), default=0.3,
+                        help='Soft AKD adaptive lambda: sigmoid midpoint. Float (e.g. 0.3) uses static normalised d0; "ma" uses per-batch mean disagreement (default 0.3)')
 
     # hint layer
     parser.add_argument('--hint_layer', default=1, type=int, choices=[0, 1, 2, 3, 4])
@@ -146,6 +146,8 @@ def parse_option():
             opt.model_name += '_l_{}_{}_nogcn'.format(opt.lambda_soft, lm)
         else:
             opt.model_name += '_l_{}_{}_a_{}_glr_{}'.format(opt.lambda_soft, lm, opt.alpha_soft, opt.gcn_lr)
+        if opt.lambda_d0 == 'ma':
+            opt.model_name += '_d0ma'
         if opt.sigma_temp != 1.0:
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
         if opt.sigma_s_mode != 'ab':
