@@ -5,6 +5,73 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class DisagreementScaler:
+    """Tracks per-term Pearson disagreement scale for power-law normalization.
+
+    Per batch: tracks the epoch's running max in a scratch buffer.
+    Per epoch: applies EMA of (momentum * d_max + (1-momentum) * epoch_max),
+               then resets the scratch buffer.
+    After lock_epoch: d_max is frozen, no further updates.
+
+    This avoids a single outlier batch locking d_max permanently while still
+    providing a stable, slowly-adapting normalizer across training.
+    """
+    def __init__(self, init=0.1, momentum=0.99, lock_epoch=150):
+        self.d_max      = {'L1': init, 'L2': init, 'L3': init}
+        self.momentum   = momentum
+        self.lock_epoch = lock_epoch
+        self._epoch_max = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+
+    def update(self, d_L1, d_L2, d_L3):
+        """Track per-batch max into epoch scratch buffer. Call once per batch."""
+        for key, d in [('L1', d_L1), ('L2', d_L2), ('L3', d_L3)]:
+            batch_max = d.max().item()
+            if batch_max > self._epoch_max[key]:
+                self._epoch_max[key] = batch_max
+
+    def step_epoch(self, epoch):
+        """Apply EMA update from this epoch's max, then reset scratch. Call once per epoch.
+
+        Epoch 1: hard update to set a real baseline (avoids init=0.1 saturation).
+        Epochs 2-lock_epoch: EMA smoothing.
+        After lock_epoch: d_max frozen.
+        """
+        if epoch <= self.lock_epoch:
+            if epoch == 1:
+                # Hard update: set d_max directly from first epoch's observed max
+                for key in self.d_max:
+                    self.d_max[key] = self._epoch_max[key]
+            else:
+                m = self.momentum
+                for key in self.d_max:
+                    self.d_max[key] = m * self.d_max[key] + (1 - m) * self._epoch_max[key]
+        self._epoch_max = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
+
+
+def compute_lambda_power(disagreement, d_max, alpha, lambda_max):
+    """Per-sample sigma weight via power function on running-max-normalised disagreement.
+
+    Higher disagreement → higher lambda, continuously and without a fixed midpoint.
+
+        d_norm = clamp(disagreement / d_max, max=1.0)
+        lambda = d_norm ^ alpha * lambda_max   ∈ [0, lambda_max]
+
+    alpha < 1 → concave curve, assigns more weight even at moderate disagreement.
+    alpha = 1 → linear mapping.
+    alpha > 1 → convex curve, concentrates weight on high-disagreement samples.
+
+    Args:
+        disagreement: [N] Pearson distances (unnormalized)
+        d_max:        running maximum for this term (scalar float)
+        alpha:        exponent controlling curve shape
+        lambda_max:   ceiling for sigma weight
+    Returns:
+        [N] lambda values in [0, lambda_max]
+    """
+    d_norm = (disagreement / d_max).clamp(max=1.0)
+    return d_norm.pow(alpha) * lambda_max
+
+
 class GCN(nn.Module):
     """Learnable confusion matrix for adaptive sigma softening."""
     def __init__(self, num_classes):
@@ -164,7 +231,7 @@ def cell_wise_lambda(T_sim, S_sim, lambda_max, k=10.0, d0=0.3):
 
 def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
                   labels, anchor_labels, sigma, lambda_soft, opt, eps=1e-7,
-                  return_stats=False):
+                  return_stats=False, scaler=None):
     """
     Soft Anchor-based Knowledge Distillation loss.
 
@@ -220,26 +287,38 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
 
     stats = None
     if lambda_mode == 'rw':
-        if return_stats:
-            lam_L1, raw_L1, gate_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
-                                     lambda_soft, lambda_k, lambda_d0, return_stats=True)
-            lam_L2, raw_L2, gate_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
-                                     lambda_soft, lambda_k, lambda_d0, return_stats=True)
-            lam_L3, raw_L3, gate_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
-                                     lambda_soft, lambda_k, lambda_d0, return_stats=True)
+        d_L1 = pearson_distance_rows(b_teacher_sim, b_student_sim)      # [B]
+        d_L2 = pearson_distance_rows(a_teacher_sim, a_student_sim)      # [B]
+        d_L3 = pearson_distance_rows(a_teacher_sim_t, a_student_sim_t)  # [A]
+
+        if scaler is not None:
+            # Power-function path: running-max normalization
+            scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
+            lambda_alpha = getattr(opt, 'lambda_alpha', 1.0)
+            lam_L1_flat = compute_lambda_power(d_L1, scaler.d_max['L1'], lambda_alpha, lambda_soft)  # [B]
+            lam_L2_flat = compute_lambda_power(d_L2, scaler.d_max['L2'], lambda_alpha, lambda_soft)  # [B]
+            lam_L3_flat = compute_lambda_power(d_L3, scaler.d_max['L3'], lambda_alpha, lambda_soft)  # [A]
+            if return_stats:
+                stats = {'raw_L1': d_L1.detach(), 'raw_L2': d_L2.detach(), 'raw_L3': d_L3.detach(),
+                         'lam_L1': lam_L1_flat.detach(), 'lam_L2': lam_L2_flat.detach(), 'lam_L3': lam_L3_flat.detach()}
+            lam_L1 = lam_L1_flat.unsqueeze(1)  # [B, 1]
+            lam_L2 = lam_L2_flat.unsqueeze(1)  # [B, 1]
+            lam_L3 = lam_L3_flat.unsqueeze(1)  # [A, 1]
+        elif return_stats:
+            # Sigmoid path with stats collection
+            lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, return_stats=True)
+            lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, return_stats=True)
+            lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, return_stats=True)
             stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
                      'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
+            lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
+            lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
+            lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
         else:
-            lam_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
-                                     lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
-            lam_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
-                                     lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
-            lam_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
-                                     lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [A, 1]
-        if return_stats:
-            lam_L1 = lam_L1.unsqueeze(1)
-            lam_L2 = lam_L2.unsqueeze(1)
-            lam_L3 = lam_L3.unsqueeze(1)
+            # Sigmoid path, normal
+            lam_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0).unsqueeze(1)  # [B, 1]
+            lam_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0).unsqueeze(1)  # [B, 1]
+            lam_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0).unsqueeze(1)  # [A, 1]
     else:  # 'cw'
         lam_L1 = cell_wise_lambda(b_teacher_sim, b_student_sim,
                                   lambda_soft, lambda_k, lambda_d0)   # [B, B]

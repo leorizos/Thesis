@@ -94,6 +94,10 @@ def parse_option():
                         help='Soft AKD adaptive lambda: sigmoid steepness (default 10.0)')
     parser.add_argument('--lambda_d0', type=lambda x: x if x == 'ma' else float(x), default=0.3,
                         help='Soft AKD adaptive lambda: sigmoid midpoint. Float (e.g. 0.3) uses static normalised d0; "ma" uses per-batch mean disagreement (default 0.3)')
+    parser.add_argument('--lambda_fn', type=str, default='sigmoid', choices=['sigmoid', 'power'],
+                        help='Soft AKD rw lambda function: sigmoid (default) or power (running-max normalised power curve)')
+    parser.add_argument('--lambda_alpha', type=float, default=1.0,
+                        help='Soft AKD power lambda: exponent alpha. <1 concave, 1 linear, >1 convex (default 1.0)')
 
     # hint layer
     parser.add_argument('--hint_layer', default=1, type=int, choices=[0, 1, 2, 3, 4])
@@ -154,8 +158,12 @@ def parse_option():
             opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
         if opt.lambda_k != 10.0:
             opt.model_name += '_lk_{}'.format(opt.lambda_k)
-        if opt.lambda_d0 != 0.3:
+        if opt.lambda_d0 != 0.3 and opt.lambda_d0 != 'ma':
             opt.model_name += '_ld_{}'.format(opt.lambda_d0)
+        if opt.lambda_fn == 'power':
+            opt.model_name += '_pw'
+            if opt.lambda_alpha != 1.0:
+                opt.model_name += '_pa_{}'.format(opt.lambda_alpha)
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
     if not os.path.isdir(opt.tb_folder):
         os.makedirs(opt.tb_folder)
@@ -527,6 +535,12 @@ def main_worker(gpu, ngpus_per_node, opt):
 
     # GCN diagnostic collectors (only used when distill == 'soft_akd' with GCN)
     gcn_snapshot_store = {} if (opt.distill == 'soft_akd' and gcn is not None) else None
+
+    # Power-function scaler: persists across epochs to track running max per term
+    dis_scaler = None
+    if opt.distill == 'soft_akd' and getattr(opt, 'lambda_mode', 'rw') == 'rw' and getattr(opt, 'lambda_fn', 'sigmoid') == 'power':
+        from distiller_zoo.SoftAKD import DisagreementScaler
+        dis_scaler = DisagreementScaler()
     gcn_loss_G_history = []
     gcn_loss_akd_history = []
 
@@ -545,13 +559,15 @@ def main_worker(gpu, ngpus_per_node, opt):
         print("==> training...")
 
         time1 = time.time()
+        epoch_loss_G, epoch_loss_akd, dis_tb_stats = 0.0, 0.0, None
         if opt.distill in ['akd', 'soft_akd']:
-            train_acc, train_acc_top5, train_loss, epoch_loss_G, epoch_loss_akd = train_distill_akd(
+            train_acc, train_acc_top5, train_loss, epoch_loss_G, epoch_loss_akd, dis_tb_stats = train_distill_akd(
                 anchor_set, anchor_net, epoch, train_loader,
                 module_list, criterion_list, optimizer, optimizer_anchor, opt, a_feat_t,
                 sigma=sigma, anchor_labels=anchor_labels,
                 gcn=gcn, optimizer_gcn=optimizer_gcn,
-                snapshot_store=gcn_snapshot_store
+                snapshot_store=gcn_snapshot_store,
+                scaler=dis_scaler
             )
             if gcn is not None:
                 gcn_loss_G_history.append(epoch_loss_G)
@@ -570,6 +586,12 @@ def main_worker(gpu, ngpus_per_node, opt):
 
             logger.log_value('train_acc', train_acc, epoch)
             logger.log_value('train_loss', train_loss, epoch)
+            logger.log_value('loss_akd', epoch_loss_akd, epoch)
+            if gcn is not None:
+                logger.log_value('loss_G', epoch_loss_G, epoch)
+            if dis_tb_stats is not None:
+                for key, val in dis_tb_stats.items():
+                    logger.log_value(key, val, epoch)
 
         # Validate every 3 epochs or on the last epoch
         if epoch % 3 == 0 or epoch == opt.epochs:

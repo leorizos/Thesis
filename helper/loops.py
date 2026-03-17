@@ -184,7 +184,8 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
 def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                       criterion_list, optimizer, optimizer_anchor, opt, a_feat_t,
                       sigma=None, anchor_labels=None,
-                      gcn=None, optimizer_gcn=None, snapshot_store=None):
+                      gcn=None, optimizer_gcn=None, snapshot_store=None,
+                      scaler=None):
     """One epoch of Anchor-based Knowledge Distillation (AKD / Soft AKD).
 
     AKD introduces learnable anchor images whose spatial attention is optimised
@@ -207,11 +208,21 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
 
     use_soft = sigma is not None and anchor_labels is not None
     use_gcn = gcn is not None and optimizer_gcn is not None
-    collect_dis = use_soft and (epoch % 5 == 0) and getattr(opt, 'lambda_mode', 'rw') == 'rw'
+    is_rw = getattr(opt, 'lambda_mode', 'rw') == 'rw'
+    collect_tb  = use_soft and is_rw           # every epoch: AverageMeters for tensorboard
+    collect_dis = collect_tb and (epoch % 5 == 0)  # every 5 epochs: full tensor lists for print
+
+    if collect_tb:
+        dis_raw_meters = {k: AverageMeter() for k in ('L1', 'L2', 'L3')}
+        dis_val_meters = {k: AverageMeter() for k in ('L1', 'L2', 'L3')}
 
     if collect_dis:
-        dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
-                                     'gate_L1', 'gate_L2', 'gate_L3')}
+        if scaler is not None:
+            dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
+                                         'lam_L1', 'lam_L2', 'lam_L3')}
+        else:
+            dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
+                                         'gate_L1', 'gate_L2', 'gate_L3')}
 
     if use_gcn:
         from distiller_zoo.SoftAKD import soften_sigma_with_gcn
@@ -291,16 +302,26 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_soft,
-                                     opt.lambda_soft, opt, return_stats=collect_dis)
+                                     opt.lambda_soft, opt, return_stats=collect_tb,
+                                     scaler=scaler)
         elif use_soft:
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma,
-                                     opt.lambda_soft, opt, return_stats=collect_dis)
+                                     opt.lambda_soft, opt, return_stats=collect_tb,
+                                     scaler=scaler)
         else:
             loss_akd = akd_loss(feat_teacher.detach(), feat_student,
                                 a_feat_t.detach(), a_feat_s, opt)
             dis_stats = None
+
+        if collect_tb and dis_stats is not None:
+            val_prefix = 'lam' if scaler is not None else 'gate'
+            for k in ('L1', 'L2', 'L3'):
+                raw_t = dis_stats[f'raw_{k}']
+                val_t = dis_stats[f'{val_prefix}_{k}']
+                dis_raw_meters[k].update(raw_t.mean().item(), raw_t.numel())
+                dis_val_meters[k].update(val_t.mean().item(), val_t.numel())
 
         if collect_dis and dis_stats is not None:
             for k in dis_accum:
@@ -348,6 +369,10 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                    loss=losses, top1=top1, top5=top5))
             sys.stdout.flush()
 
+    # Power scaler: apply per-epoch EMA update
+    if scaler is not None:
+        scaler.step_epoch(epoch)
+
     # GCN monitoring at end of epoch
     if use_gcn:
         monitor_gcn(gcn, epoch, n_cls, sigma=sigma,
@@ -355,10 +380,31 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
 
     # Disagreement stats every 5 epochs (rw mode only)
     if collect_dis and any(len(v) > 0 for v in dis_accum.values()):
-        from distiller_zoo.SoftAKD2 import print_disagreement_stats
-        print_disagreement_stats(dis_accum, epoch, opt)
+        if scaler is not None:
+            from distiller_zoo.SoftAKD2 import print_disagreement_stats_power
+            print_disagreement_stats_power(dis_accum, epoch, opt, scaler.d_max)
+        else:
+            from distiller_zoo.SoftAKD2 import print_disagreement_stats
+            print_disagreement_stats(dis_accum, epoch, opt)
 
-    return top1.avg, top5.avg, losses.avg, loss_G_meter.avg, loss_akd_meter.avg
+    # Build tensorboard stats dict (every epoch)
+    dis_tb_stats = None
+    if collect_tb:
+        lambda_soft = getattr(opt, 'lambda_soft', 0.3)
+        dis_tb_stats = {
+            'dis_raw_L1': dis_raw_meters['L1'].avg,
+            'dis_raw_L2': dis_raw_meters['L2'].avg,
+            'dis_raw_L3': dis_raw_meters['L3'].avg,
+        }
+        if scaler is not None:
+            for k in ('L1', 'L2', 'L3'):
+                dis_tb_stats[f'lam_pct_{k}'] = 100.0 * dis_val_meters[k].avg / lambda_soft
+                dis_tb_stats[f'run_dmax_{k}'] = scaler.d_max[k]
+        else:
+            for k in ('L1', 'L2', 'L3'):
+                dis_tb_stats[f'avg_gate_{k}'] = dis_val_meters[k].avg
+
+    return top1.avg, top5.avg, losses.avg, loss_G_meter.avg, loss_akd_meter.avg, dis_tb_stats
 
 
 def validate_vanilla(val_loader, model, criterion, opt):

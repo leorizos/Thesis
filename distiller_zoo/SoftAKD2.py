@@ -1,8 +1,18 @@
 from __future__ import print_function, division
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _log_to_file(text, save_folder):
+    """Append text to disagreement_stats.txt in save_folder."""
+    if save_folder is None:
+        return
+    path = os.path.join(save_folder, 'disagreement_stats.txt')
+    with open(path, 'a') as f:
+        f.write(text + '\n')
 
 
 class GCN(nn.Module):
@@ -113,19 +123,19 @@ def print_disagreement_stats(accum, epoch, opt):
                 gate_L1, gate_L2, gate_L3 (sigmoid outputs in [0, 1])
     All values are flat CPU tensors concatenated across all batches.
     """
-    import torch
-    lambda_d0  = getattr(opt, 'lambda_d0',   0.3)
-    lambda_k   = getattr(opt, 'lambda_k',    10.0)
+    lambda_d0   = getattr(opt, 'lambda_d0',   0.3)
+    lambda_k    = getattr(opt, 'lambda_k',    10.0)
     lambda_soft = getattr(opt, 'lambda_soft', 0.3)
+    save_folder = getattr(opt, 'save_folder', None)
 
-    print("\n" + "=" * 65)
-    print(f"Disagreement Stats - Epoch {epoch}  "
-          f"[d0={lambda_d0}, k={lambda_k}, lambda_max={lambda_soft}]")
-    print("=" * 65)
-    header = f"{'Term':<10} {'AvgRawDis':>10} {'AvgGate':>9} "  \
-             f"{'gate>0.5':>10} {'gate>0.9':>10} {'gate<0.1':>10}"
-    print(header)
-    print("-" * 65)
+    lines = []
+    lines.append("\n" + "=" * 65)
+    lines.append(f"Disagreement Stats - Epoch {epoch}  "
+                 f"[d0={lambda_d0}, k={lambda_k}, lambda_max={lambda_soft}]")
+    lines.append("=" * 65)
+    lines.append(f"{'Term':<10} {'AvgRawDis':>10} {'AvgGate':>9} "
+                 f"{'gate>0.5':>10} {'gate>0.9':>10} {'gate<0.1':>10}")
+    lines.append("-" * 65)
 
     term_names = [('L1 B↔B', 'raw_L1', 'gate_L1'),
                   ('L2 B↔A', 'raw_L2', 'gate_L2'),
@@ -134,16 +144,65 @@ def print_disagreement_stats(accum, epoch, opt):
     for label, raw_key, gate_key in term_names:
         raw  = torch.cat(accum[raw_key])
         gate = torch.cat(accum[gate_key])
-        n = gate.numel()
         avg_raw  = raw.mean().item()
         avg_gate = gate.mean().item()
         pct_pass = 100.0 * (gate > 0.5).float().mean().item()
         pct_high = 100.0 * (gate > 0.9).float().mean().item()
         pct_low  = 100.0 * (gate < 0.1).float().mean().item()
-        print(f"{label:<10} {avg_raw:>10.4f} {avg_gate:>9.4f} "
-              f"{pct_pass:>9.1f}% {pct_high:>9.1f}% {pct_low:>9.1f}%")
+        lines.append(f"{label:<10} {avg_raw:>10.4f} {avg_gate:>9.4f} "
+                     f"{pct_pass:>9.1f}% {pct_high:>9.1f}% {pct_low:>9.1f}%")
 
-    print("=" * 65 + "\n")
+    lines.append("=" * 65 + "\n")
+
+    output = '\n'.join(lines)
+    print(output)
+    _log_to_file(output, save_folder)
+
+
+def print_disagreement_stats_power(accum, epoch, opt, d_max):
+    """Print per-term disagreement statistics for the power-function lambda path.
+
+    Reports 5 diagnostics per term:
+      1. Avg raw Pearson disagreement (absolute magnitude)
+      2. Max raw Pearson disagreement seen this epoch
+      3. Running d_max (the normalizer currently in use)
+      4. Avg lambda as % of lambda_max (avg effective sigma injection)
+      5. % samples with lam > 0.9*lambda_max (high) and lam < 0.1*lambda_max (low)
+    """
+    lambda_alpha = getattr(opt, 'lambda_alpha', 1.0)
+    lambda_soft  = getattr(opt, 'lambda_soft',  0.3)
+    save_folder  = getattr(opt, 'save_folder',  None)
+
+    lines = []
+    lines.append("\n" + "=" * 72)
+    lines.append(f"Disagreement Stats - Epoch {epoch}  "
+                 f"[power, alpha={lambda_alpha}, lambda_max={lambda_soft}]")
+    lines.append("=" * 72)
+    lines.append(f"{'Term':<10} {'AvgRawDis':>10} {'MaxRawDis':>10} {'RunDmax':>9} "
+                 f"{'AvgLam%':>9} {'lam>90%':>8} {'lam<10%':>8}")
+    lines.append("-" * 72)
+
+    term_names = [('L1 B↔B', 'raw_L1', 'lam_L1', 'L1'),
+                  ('L2 B↔A', 'raw_L2', 'lam_L2', 'L2'),
+                  ('L3 A↔B', 'raw_L3', 'lam_L3', 'L3')]
+
+    for label, raw_key, lam_key, dmax_key in term_names:
+        raw = torch.cat(accum[raw_key])
+        lam = torch.cat(accum[lam_key])
+        avg_raw     = raw.mean().item()
+        max_raw     = raw.max().item()
+        run_dmax    = d_max[dmax_key]
+        avg_lam_pct = 100.0 * lam.mean().item() / lambda_soft
+        pct_high    = 100.0 * (lam > 0.9 * lambda_soft).float().mean().item()
+        pct_low     = 100.0 * (lam < 0.1 * lambda_soft).float().mean().item()
+        lines.append(f"{label:<10} {avg_raw:>10.4f} {max_raw:>10.4f} {run_dmax:>9.4f} "
+                     f"{avg_lam_pct:>8.1f}% {pct_high:>7.1f}% {pct_low:>7.1f}%")
+
+    lines.append("=" * 72 + "\n")
+
+    output = '\n'.join(lines)
+    print(output)
+    _log_to_file(output, save_folder)
 
 
 SNAPSHOT_EPOCHS = {1, 150, 180, 210, 240}
