@@ -207,6 +207,11 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
 
     use_soft = sigma is not None and anchor_labels is not None
     use_gcn = gcn is not None and optimizer_gcn is not None
+    collect_dis = use_soft and (epoch % 5 == 0) and getattr(opt, 'lambda_mode', 'rw') == 'rw'
+
+    if collect_dis:
+        dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
+                                     'gate_L1', 'gate_L2', 'gate_L3')}
 
     if use_gcn:
         from distiller_zoo.SoftAKD import soften_sigma_with_gcn
@@ -283,18 +288,23 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                 sigma_s_mode=getattr(opt, 'sigma_s_mode', 'ab')
             )
             # Use softened sigma in existing soft_akd_loss
-            loss_akd = soft_akd_loss(feat_teacher.detach(), feat_student,
+            loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_soft,
-                                     opt.lambda_soft, opt)
+                                     opt.lambda_soft, opt, return_stats=collect_dis)
         elif use_soft:
-            loss_akd = soft_akd_loss(feat_teacher.detach(), feat_student,
+            loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma,
-                                     opt.lambda_soft, opt)
+                                     opt.lambda_soft, opt, return_stats=collect_dis)
         else:
             loss_akd = akd_loss(feat_teacher.detach(), feat_student,
                                 a_feat_t.detach(), a_feat_s, opt)
+            dis_stats = None
+
+        if collect_dis and dis_stats is not None:
+            for k in dis_accum:
+                dis_accum[k].append(dis_stats[k].cpu())
 
         loss = opt.cls * loss_cls + opt.div * loss_div + opt.beta * loss_akd
         losses.update(loss.item(), images.size(0))
@@ -342,6 +352,11 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     if use_gcn:
         monitor_gcn(gcn, epoch, n_cls, sigma=sigma,
                     alpha=opt.alpha_soft, snapshot_store=snapshot_store)
+
+    # Disagreement stats every 5 epochs (rw mode only)
+    if collect_dis and any(len(v) > 0 for v in dis_accum.values()):
+        from distiller_zoo.SoftAKD2 import print_disagreement_stats
+        print_disagreement_stats(dis_accum, epoch, opt)
 
     return top1.avg, top5.avg, losses.avg, loss_G_meter.avg, loss_akd_meter.avg
 

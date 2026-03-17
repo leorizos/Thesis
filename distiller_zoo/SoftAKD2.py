@@ -104,6 +104,48 @@ def soften_sigma_with_gcn(sigma, feat_teacher, feat_student,
     return Sigma_t_hat.detach(), loss_G
 
 
+def print_disagreement_stats(accum, epoch, opt):
+    """Print per-term disagreement statistics accumulated over a full epoch.
+
+    Called every 5 epochs from train_distill_akd (rw mode only).
+
+    accum keys: raw_L1, raw_L2, raw_L3 (Pearson distances, unnormalized)
+                gate_L1, gate_L2, gate_L3 (sigmoid outputs in [0, 1])
+    All values are flat CPU tensors concatenated across all batches.
+    """
+    import torch
+    lambda_d0  = getattr(opt, 'lambda_d0',   0.3)
+    lambda_k   = getattr(opt, 'lambda_k',    10.0)
+    lambda_soft = getattr(opt, 'lambda_soft', 0.3)
+
+    print("\n" + "=" * 65)
+    print(f"Disagreement Stats - Epoch {epoch}  "
+          f"[d0={lambda_d0}, k={lambda_k}, lambda_max={lambda_soft}]")
+    print("=" * 65)
+    header = f"{'Term':<10} {'AvgRawDis':>10} {'AvgGate':>9} "  \
+             f"{'gate>0.5':>10} {'gate>0.9':>10} {'gate<0.1':>10}"
+    print(header)
+    print("-" * 65)
+
+    term_names = [('L1 B↔B', 'raw_L1', 'gate_L1'),
+                  ('L2 B↔A', 'raw_L2', 'gate_L2'),
+                  ('L3 A↔B', 'raw_L3', 'gate_L3')]
+
+    for label, raw_key, gate_key in term_names:
+        raw  = torch.cat(accum[raw_key])
+        gate = torch.cat(accum[gate_key])
+        n = gate.numel()
+        avg_raw  = raw.mean().item()
+        avg_gate = gate.mean().item()
+        pct_pass = 100.0 * (gate > 0.5).float().mean().item()
+        pct_high = 100.0 * (gate > 0.9).float().mean().item()
+        pct_low  = 100.0 * (gate < 0.1).float().mean().item()
+        print(f"{label:<10} {avg_raw:>10.4f} {avg_gate:>9.4f} "
+              f"{pct_pass:>9.1f}% {pct_high:>9.1f}% {pct_low:>9.1f}%")
+
+    print("=" * 65 + "\n")
+
+
 SNAPSHOT_EPOCHS = {1, 150, 180, 210, 240}
 
 

@@ -103,7 +103,7 @@ def pearson_distance_rows(P, Q, eps=1e-7):
     return 1.0 - F.cosine_similarity(P_c, Q_c, dim=1, eps=eps)  # [N]
 
 
-def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7):
+def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_stats=False):
     """
     Per-sample sigma weight via sigmoid gate on normalised Pearson disagreement.
 
@@ -118,15 +118,19 @@ def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7):
         lambda_max:   scalar ceiling for sigma weight (e.g. 0.3 → max 30% sigma)
         k:            sigmoid steepness (default 10.0)
         d0:           sigmoid midpoint on normalized scale (default 0.3)
+        return_stats: if True, also return (raw_dis, gate) before scaling
     Returns:
-        [N] per-sample sigma weight values
+        [N] per-sample sigma weight values (and optionally raw_dis, gate)
     """
+    raw_dis = disagreement.detach()
     if d0 == 'ma':
         midpoint = disagreement.mean()
     else:
         disagreement = disagreement / (disagreement.max() + eps)
         midpoint = d0
     gate = torch.sigmoid(k * (disagreement - midpoint))
+    if return_stats:
+        return gate * lambda_max, raw_dis, gate.detach()
     return gate * lambda_max  # [N]
 
 
@@ -159,7 +163,8 @@ def cell_wise_lambda(T_sim, S_sim, lambda_max, k=10.0, d0=0.3):
 
 
 def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
-                  labels, anchor_labels, sigma, lambda_soft, opt, eps=1e-7):
+                  labels, anchor_labels, sigma, lambda_soft, opt, eps=1e-7,
+                  return_stats=False):
     """
     Soft Anchor-based Knowledge Distillation loss.
 
@@ -213,13 +218,28 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     lambda_d0   = getattr(opt, 'lambda_d0',   0.3)
     lambda_mode = getattr(opt, 'lambda_mode', 'rw')
 
+    stats = None
     if lambda_mode == 'rw':
-        lam_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
-                                 lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
-        lam_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
-                                 lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
-        lam_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
-                                 lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [A, 1]
+        if return_stats:
+            lam_L1, raw_L1, gate_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
+                                     lambda_soft, lambda_k, lambda_d0, return_stats=True)
+            lam_L2, raw_L2, gate_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
+                                     lambda_soft, lambda_k, lambda_d0, return_stats=True)
+            lam_L3, raw_L3, gate_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
+                                     lambda_soft, lambda_k, lambda_d0, return_stats=True)
+            stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
+                     'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
+        else:
+            lam_L1 = adaptive_lambda(pearson_distance_rows(b_teacher_sim, b_student_sim),
+                                     lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
+            lam_L2 = adaptive_lambda(pearson_distance_rows(a_teacher_sim, a_student_sim),
+                                     lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [B, 1]
+            lam_L3 = adaptive_lambda(pearson_distance_rows(a_teacher_sim_t, a_student_sim_t),
+                                     lambda_soft, lambda_k, lambda_d0).unsqueeze(1)   # [A, 1]
+        if return_stats:
+            lam_L1 = lam_L1.unsqueeze(1)
+            lam_L2 = lam_L2.unsqueeze(1)
+            lam_L3 = lam_L3.unsqueeze(1)
     else:  # 'cw'
         lam_L1 = cell_wise_lambda(b_teacher_sim, b_student_sim,
                                   lambda_soft, lambda_k, lambda_d0)   # [B, B]
@@ -246,4 +266,4 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     L_3 = torch.sum(a_teacher_sim_t * torch.log((a_teacher_sim_t + eps) / (a_student_sim_t + eps)))
 
     AKD_loss = opt.l_1 * L_1 + L_2 * (1 - opt.l_2) + L_3 * opt.l_2
-    return AKD_loss
+    return AKD_loss, stats
