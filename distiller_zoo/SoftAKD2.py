@@ -114,7 +114,7 @@ def soften_sigma_with_gcn(sigma, feat_teacher, feat_student,
     return Sigma_t_hat.detach(), loss_G
 
 
-def print_disagreement_stats(accum, epoch, opt):
+def print_disagreement_stats(accum, epoch, opt, scaler=None):
     """Print per-term disagreement statistics accumulated over a full epoch.
 
     Called every 5 epochs from train_distill_akd (rw mode only).
@@ -128,31 +128,41 @@ def print_disagreement_stats(accum, epoch, opt):
     lambda_soft = getattr(opt, 'lambda_soft', 0.3)
     save_folder = getattr(opt, 'save_folder', None)
 
+    d_mean   = scaler.d_mean if scaler is not None else None
+    d_std    = scaler.d_std  if scaler is not None else None
+    d0_src   = 'tracked' if d_mean is not None else str(lambda_d0)
+    k_mode   = getattr(opt, 'lambda_k_mode',  'static')
+    k_scale  = getattr(opt, 'lambda_k_scale', 1.0)
+    k_src    = f'{k_scale}/std' if k_mode == 'auto' else str(lambda_k)
+
     lines = []
-    lines.append("\n" + "=" * 65)
+    lines.append("\n" + "=" * 80)
     lines.append(f"Disagreement Stats - Epoch {epoch}  "
-                 f"[d0={lambda_d0}, k={lambda_k}, lambda_max={lambda_soft}]")
-    lines.append("=" * 65)
-    lines.append(f"{'Term':<10} {'AvgRawDis':>10} {'AvgGate':>9} "
-                 f"{'gate>0.5':>10} {'gate>0.9':>10} {'gate<0.1':>10}")
-    lines.append("-" * 65)
+                 f"[sigmoid, d0={d0_src}, k={k_src}, lambda_max={lambda_soft}]")
+    lines.append("=" * 80)
+    lines.append(f"{'Term':<10} {'AvgRawDis':>10} {'d_mean':>8} {'d_std':>7} {'k_eff':>7} {'AvgGate':>9} "
+                 f"{'gate>0.5':>9} {'gate>0.9':>9} {'gate<0.1':>9}")
+    lines.append("-" * 80)
 
-    term_names = [('L1 B↔B', 'raw_L1', 'gate_L1'),
-                  ('L2 B↔A', 'raw_L2', 'gate_L2'),
-                  ('L3 A↔B', 'raw_L3', 'gate_L3')]
+    term_names = [('L1 B↔B', 'raw_L1', 'gate_L1', 'L1'),
+                  ('L2 B↔A', 'raw_L2', 'gate_L2', 'L2'),
+                  ('L3 A↔B', 'raw_L3', 'gate_L3', 'L3')]
 
-    for label, raw_key, gate_key in term_names:
+    for label, raw_key, gate_key, dkey in term_names:
         raw  = torch.cat(accum[raw_key])
         gate = torch.cat(accum[gate_key])
-        avg_raw  = raw.mean().item()
-        avg_gate = gate.mean().item()
-        pct_pass = 100.0 * (gate > 0.5).float().mean().item()
-        pct_high = 100.0 * (gate > 0.9).float().mean().item()
-        pct_low  = 100.0 * (gate < 0.1).float().mean().item()
-        lines.append(f"{label:<10} {avg_raw:>10.4f} {avg_gate:>9.4f} "
-                     f"{pct_pass:>9.1f}% {pct_high:>9.1f}% {pct_low:>9.1f}%")
+        avg_raw   = raw.mean().item()
+        avg_gate  = gate.mean().item()
+        pct_pass  = 100.0 * (gate > 0.5).float().mean().item()
+        pct_high  = 100.0 * (gate > 0.9).float().mean().item()
+        pct_low   = 100.0 * (gate < 0.1).float().mean().item()
+        dmean_val = d_mean[dkey] if d_mean is not None else float('nan')
+        dstd_val  = d_std[dkey]  if d_std  is not None else float('nan')
+        k_eff_val = k_scale / (dstd_val + 1e-7) if (d_std is not None and k_mode == 'auto') else lambda_k
+        lines.append(f"{label:<10} {avg_raw:>10.4f} {dmean_val:>8.4f} {dstd_val:>7.4f} {k_eff_val:>7.2f} {avg_gate:>9.4f} "
+                     f"{pct_pass:>8.1f}% {pct_high:>8.1f}% {pct_low:>8.1f}%")
 
-    lines.append("=" * 65 + "\n")
+    lines.append("=" * 80 + "\n")
 
     output = '\n'.join(lines)
     print(output)

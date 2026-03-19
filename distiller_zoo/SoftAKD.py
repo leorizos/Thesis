@@ -16,11 +16,16 @@ class DisagreementScaler:
     This avoids a single outlier batch locking d_max permanently while still
     providing a stable, slowly-adapting normalizer across training.
     """
-    def __init__(self, init=0.1, momentum=0.99, lock_epoch=150):
+    def __init__(self, init=0.1, momentum=0.99, lock_epoch=180):
         self.d_max      = {'L1': init, 'L2': init, 'L3': init}
+        self.d_mean     = {'L1': init, 'L2': init, 'L3': init}
         self.momentum   = momentum
         self.lock_epoch = lock_epoch
         self._epoch_max = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+        self._epoch_sum = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+        self._epoch_n   = {'L1': 0,    'L2': 0,    'L3': 0}
+        self.d_std      = {'L1': init, 'L2': init, 'L3': init}
+        self._epoch_sq  = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
 
     def update(self, d_L1, d_L2, d_L3):
         """Track per-batch max into epoch scratch buffer. Call once per batch."""
@@ -28,6 +33,9 @@ class DisagreementScaler:
             batch_max = d.max().item()
             if batch_max > self._epoch_max[key]:
                 self._epoch_max[key] = batch_max
+            self._epoch_sum[key] += d.sum().item()
+            self._epoch_n[key]   += d.numel()
+            self._epoch_sq[key]  += (d ** 2).sum().item()
 
     def step_epoch(self, epoch):
         """Apply EMA update from this epoch's max, then reset scratch. Call once per epoch.
@@ -41,11 +49,20 @@ class DisagreementScaler:
                 # Hard update: set d_max directly from first epoch's observed max
                 for key in self.d_max:
                     self.d_max[key] = self._epoch_max[key]
+                    self.d_mean[key] = self._epoch_sum[key] / self._epoch_n[key]
+                    self.d_std[key] = (self._epoch_sq[key] / self._epoch_n[key] - self.d_mean[key] ** 2) ** 0.5
             else:
                 m = self.momentum
                 for key in self.d_max:
                     self.d_max[key] = m * self.d_max[key] + (1 - m) * self._epoch_max[key]
+                    epoch_mean = self._epoch_sum[key] / self._epoch_n[key]
+                    self.d_mean[key] = m * self.d_mean[key] + (1 - m) * epoch_mean
+                    epoch_std = (self._epoch_sq[key] / self._epoch_n[key] - epoch_mean ** 2) ** 0.5
+                    self.d_std[key] = m * self.d_std[key] + (1 - m) * epoch_std
         self._epoch_max = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
+        self._epoch_sum = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
+        self._epoch_n   = {'L1': 0,   'L2': 0,   'L3': 0}
+        self._epoch_sq  = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
 
 
 def compute_lambda_power(disagreement, d_max, alpha, lambda_max):
@@ -170,7 +187,7 @@ def pearson_distance_rows(P, Q, eps=1e-7):
     return 1.0 - F.cosine_similarity(P_c, Q_c, dim=1, eps=eps)  # [N]
 
 
-def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_stats=False):
+def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_stats=False, d0_override=None, k_override=None):
     """
     Per-sample sigma weight via sigmoid gate on normalised Pearson disagreement.
 
@@ -190,12 +207,15 @@ def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_s
         [N] per-sample sigma weight values (and optionally raw_dis, gate)
     """
     raw_dis = disagreement.detach()
-    if d0 == 'ma':
+    if d0_override is not None:
+        midpoint = d0_override
+    elif d0 == 'ma':
         midpoint = disagreement.mean()
     else:
         disagreement = disagreement / (disagreement.max() + eps)
         midpoint = d0
-    gate = torch.sigmoid(k * (disagreement - midpoint))
+    k_eff = k_override if k_override is not None else k
+    gate = torch.sigmoid(k_eff * (disagreement - midpoint))
     if return_stats:
         return gate * lambda_max, raw_dis, gate.detach()
     return gate * lambda_max  # [N]
@@ -306,9 +326,13 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
             lam_L3 = lam_L3_flat.unsqueeze(1)  # [A, 1]
         elif return_stats:
             # Sigmoid path with stats collection
-            lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, return_stats=True)
-            lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, return_stats=True)
-            lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, return_stats=True)
+            k_mode = getattr(opt, 'lambda_k_mode', 'static')
+            k_scale = getattr(opt, 'lambda_k_scale', 1.0)
+            d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
+            k0s = {k: k_scale / (scaler.d_std[k] + 1e-7) for k in ('L1', 'L2', 'L3')} if (scaler is not None and k_mode == 'auto') else {}
+            lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L1'), k_override=k0s.get('L1'))
+            lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L2'), k_override=k0s.get('L2'))
+            lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L3'), k_override=k0s.get('L3'))
             stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
                      'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
             lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
@@ -316,9 +340,13 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
             lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
         else:
             # Sigmoid path, normal
-            lam_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0).unsqueeze(1)  # [B, 1]
-            lam_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0).unsqueeze(1)  # [B, 1]
-            lam_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0).unsqueeze(1)  # [A, 1]
+            k_mode = getattr(opt, 'lambda_k_mode', 'static')
+            k_scale = getattr(opt, 'lambda_k_scale', 1.0)
+            d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
+            k0s = {k: k_scale / (scaler.d_std[k] + 1e-7) for k in ('L1', 'L2', 'L3')} if (scaler is not None and k_mode == 'auto') else {}
+            lam_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
+            lam_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
+            lam_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
     else:  # 'cw'
         lam_L1 = cell_wise_lambda(b_teacher_sim, b_student_sim,
                                   lambda_soft, lambda_k, lambda_d0)   # [B, B]

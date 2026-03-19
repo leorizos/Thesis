@@ -91,13 +91,19 @@ def parse_option():
                         help='Soft AKD: how to compute Sigma_s for GCN training. '
                              'ab=batch-to-anchor (default), aa=anchor-to-anchor, bb=batch-to-batch')
     parser.add_argument('--lambda_k', type=float, default=10.0,
-                        help='Soft AKD adaptive lambda: sigmoid steepness (default 10.0)')
+                        help='Soft AKD adaptive lambda: sigmoid steepness (default 10.0, used when lambda_k_mode=static)')
+    parser.add_argument('--lambda_k_mode', type=str, default='static', choices=['static', 'auto'],
+                        help='Soft AKD sigmoid steepness mode: static (fixed lambda_k) or auto (lambda_k_scale/std, default static)')
+    parser.add_argument('--lambda_k_scale', type=float, default=1.0,
+                        help='Soft AKD auto steepness numerator: k = lambda_k_scale / std (default 1.0, used when lambda_k_mode=auto)')
     parser.add_argument('--lambda_d0', type=lambda x: x if x == 'ma' else float(x), default=0.3,
                         help='Soft AKD adaptive lambda: sigmoid midpoint. Float (e.g. 0.3) uses static normalised d0; "ma" uses per-batch mean disagreement (default 0.3)')
     parser.add_argument('--lambda_fn', type=str, default='sigmoid', choices=['sigmoid', 'power'],
                         help='Soft AKD rw lambda function: sigmoid (default) or power (running-max normalised power curve)')
     parser.add_argument('--lambda_alpha', type=float, default=1.0,
                         help='Soft AKD power lambda: exponent alpha. <1 concave, 1 linear, >1 convex (default 1.0)')
+    parser.add_argument('--tag', type=str, default='',
+                        help='Optional tag appended to model name for run identification')
 
     # hint layer
     parser.add_argument('--hint_layer', default=1, type=int, choices=[0, 1, 2, 3, 4])
@@ -156,7 +162,9 @@ def parse_option():
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
         if opt.sigma_s_mode != 'ab':
             opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
-        if opt.lambda_k != 10.0:
+        if opt.lambda_k_mode == 'auto':
+            opt.model_name += '_ks_{}'.format(opt.lambda_k_scale)
+        elif opt.lambda_k != 10.0:
             opt.model_name += '_lk_{}'.format(opt.lambda_k)
         if opt.lambda_d0 != 0.3 and opt.lambda_d0 != 'ma':
             opt.model_name += '_ld_{}'.format(opt.lambda_d0)
@@ -164,6 +172,8 @@ def parse_option():
             opt.model_name += '_pw'
             if opt.lambda_alpha != 1.0:
                 opt.model_name += '_pa_{}'.format(opt.lambda_alpha)
+    if opt.tag:
+        opt.model_name += '_{}'.format(opt.tag)
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
     if not os.path.isdir(opt.tb_folder):
         os.makedirs(opt.tb_folder)
@@ -536,9 +546,9 @@ def main_worker(gpu, ngpus_per_node, opt):
     # GCN diagnostic collectors (only used when distill == 'soft_akd' with GCN)
     gcn_snapshot_store = {} if (opt.distill == 'soft_akd' and gcn is not None) else None
 
-    # Power-function scaler: persists across epochs to track running max per term
+    # Disagreement scaler: persists across epochs to track running max/mean per term
     dis_scaler = None
-    if opt.distill == 'soft_akd' and getattr(opt, 'lambda_mode', 'rw') == 'rw' and getattr(opt, 'lambda_fn', 'sigmoid') == 'power':
+    if opt.distill == 'soft_akd' and getattr(opt, 'lambda_mode', 'rw') == 'rw':
         from distiller_zoo.SoftAKD import DisagreementScaler
         dis_scaler = DisagreementScaler()
     gcn_loss_G_history = []
