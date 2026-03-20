@@ -321,7 +321,7 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
             dis_stats = None
 
         if collect_tb and dis_stats is not None:
-            val_prefix = 'lam' if scaler is not None else 'gate'
+            val_prefix = 'lam' if is_power else 'gate'
             for k in ('L1', 'L2', 'L3'):
                 raw_t = dis_stats[f'raw_{k}']
                 val_t = dis_stats[f'{val_prefix}_{k}']

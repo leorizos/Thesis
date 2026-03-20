@@ -52,7 +52,7 @@ class DisagreementScaler:
                     self.d_mean[key] = self._epoch_sum[key] / self._epoch_n[key]
                     self.d_std[key] = (self._epoch_sq[key] / self._epoch_n[key] - self.d_mean[key] ** 2) ** 0.5
             else:
-                m = self.momentum
+                m = 0.9 if epoch <= 15 else self.momentum
                 for key in self.d_max:
                     self.d_max[key] = m * self.d_max[key] + (1 - m) * self._epoch_max[key]
                     epoch_mean = self._epoch_sum[key] / self._epoch_n[key]
@@ -312,8 +312,11 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         d_L3 = pearson_distance_rows(a_teacher_sim_t, a_student_sim_t)  # [A]
 
         if scaler is not None:
-            # Power-function path: running-max normalization
             scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
+
+        is_power = getattr(opt, 'lambda_fn', 'sigmoid') == 'power'
+        if is_power and scaler is not None:
+            # Power-function path: running-max normalization
             lambda_alpha = getattr(opt, 'lambda_alpha', 1.0)
             lam_L1_flat = compute_lambda_power(d_L1, scaler.d_max['L1'], lambda_alpha, lambda_soft)  # [B]
             lam_L2_flat = compute_lambda_power(d_L2, scaler.d_max['L2'], lambda_alpha, lambda_soft)  # [B]
