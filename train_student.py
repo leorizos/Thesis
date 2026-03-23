@@ -85,8 +85,6 @@ def parse_option():
     parser.add_argument('--alpha_soft', type=float, default=0.1, help='Soft AKD: GCN blending weight (0 = original sigma, 1 = full GCN)')
     parser.add_argument('--gcn_lr', type=float, default=1e-4, help='Soft AKD: learning rate for GCN')
     parser.add_argument('--no_gcn', action='store_true', help='Soft AKD: disable GCN softening (use raw sigma only)')
-    parser.add_argument('--lambda_mode', type=str, default='rw', choices=['cw', 'rw'],
-                        help='Soft AKD: lambda computation mode. cw=cell-wise sigmoid (default), rw=row-wise Pearson')
     parser.add_argument('--sigma_s_mode', type=str, default='ab', choices=['ab', 'aa', 'bb'],
                         help='Soft AKD: how to compute Sigma_s for GCN training. '
                              'ab=batch-to-anchor (default), aa=anchor-to-anchor, bb=batch-to-batch')
@@ -98,10 +96,6 @@ def parse_option():
                         help='Soft AKD auto steepness numerator: k = lambda_k_scale / std (default 1.0, used when lambda_k_mode=auto)')
     parser.add_argument('--lambda_d0', type=lambda x: x if x == 'ma' else float(x), default=0.3,
                         help='Soft AKD adaptive lambda: sigmoid midpoint. Float (e.g. 0.3) uses static normalised d0; "ma" uses per-batch mean disagreement (default 0.3)')
-    parser.add_argument('--lambda_fn', type=str, default='sigmoid', choices=['sigmoid', 'power'],
-                        help='Soft AKD rw lambda function: sigmoid (default) or power (running-max normalised power curve)')
-    parser.add_argument('--lambda_alpha', type=float, default=1.0,
-                        help='Soft AKD power lambda: exponent alpha. <1 concave, 1 linear, >1 convex (default 1.0)')
     parser.add_argument('--tag', type=str, default='',
                         help='Optional tag appended to model name for run identification')
 
@@ -168,10 +162,6 @@ def parse_option():
             opt.model_name += '_lk_{}'.format(opt.lambda_k)
         if opt.lambda_d0 != 0.3 and opt.lambda_d0 != 'ma':
             opt.model_name += '_ld_{}'.format(opt.lambda_d0)
-        if opt.lambda_fn == 'power':
-            opt.model_name += '_pw'
-            if opt.lambda_alpha != 1.0:
-                opt.model_name += '_pa_{}'.format(opt.lambda_alpha)
     if opt.tag:
         opt.model_name += '_{}'.format(opt.tag)
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)

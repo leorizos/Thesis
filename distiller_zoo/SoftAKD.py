@@ -16,7 +16,7 @@ class DisagreementScaler:
     This avoids a single outlier batch locking d_max permanently while still
     providing a stable, slowly-adapting normalizer across training.
     """
-    def __init__(self, init=0.1, momentum=0.99, lock_epoch=180):
+    def __init__(self, init=0.1, momentum=0.99, lock_epoch=150):
         self.d_max      = {'L1': init, 'L2': init, 'L3': init}
         self.d_mean     = {'L1': init, 'L2': init, 'L3': init}
         self.momentum   = momentum
@@ -52,7 +52,7 @@ class DisagreementScaler:
                     self.d_mean[key] = self._epoch_sum[key] / self._epoch_n[key]
                     self.d_std[key] = (self._epoch_sq[key] / self._epoch_n[key] - self.d_mean[key] ** 2) ** 0.5
             else:
-                m = 0.9 if epoch <= 15 else self.momentum
+                m = 0.9 if epoch <= 20 else self.momentum
                 for key in self.d_max:
                     self.d_max[key] = m * self.d_max[key] + (1 - m) * self._epoch_max[key]
                     epoch_mean = self._epoch_sum[key] / self._epoch_n[key]
@@ -64,29 +64,6 @@ class DisagreementScaler:
         self._epoch_n   = {'L1': 0,   'L2': 0,   'L3': 0}
         self._epoch_sq  = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
 
-
-def compute_lambda_power(disagreement, d_max, alpha, lambda_max):
-    """Per-sample sigma weight via power function on running-max-normalised disagreement.
-
-    Higher disagreement → higher lambda, continuously and without a fixed midpoint.
-
-        d_norm = clamp(disagreement / d_max, max=1.0)
-        lambda = d_norm ^ alpha * lambda_max   ∈ [0, lambda_max]
-
-    alpha < 1 → concave curve, assigns more weight even at moderate disagreement.
-    alpha = 1 → linear mapping.
-    alpha > 1 → convex curve, concentrates weight on high-disagreement samples.
-
-    Args:
-        disagreement: [N] Pearson distances (unnormalized)
-        d_max:        running maximum for this term (scalar float)
-        alpha:        exponent controlling curve shape
-        lambda_max:   ceiling for sigma weight
-    Returns:
-        [N] lambda values in [0, lambda_max]
-    """
-    d_norm = (disagreement / d_max).clamp(max=1.0)
-    return d_norm.pow(alpha) * lambda_max
 
 
 class GCN(nn.Module):
@@ -221,33 +198,6 @@ def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_s
     return gate * lambda_max  # [N]
 
 
-def cell_wise_lambda(T_sim, S_sim, lambda_max, k=10.0, d0=0.3):
-    """
-    Cell-wise sigma weight matrix via sigmoid gate on absolute disagreement.
-
-    When teacher and student agree on a cell → sigma weight ≈ 0.0 (pure teacher).
-    When they disagree strongly on a cell → sigma weight → lambda_max.
-
-        disagreement = |T_sim - S_sim|             (already in [0, 1])
-        gate         = sigmoid(k * (disagreement - d0))
-        lambda       = gate * lambda_max            ∈ [0, lambda_max]
-
-    Args:
-        T_sim, S_sim: tensors of same shape, values in [0, 1]
-        lambda_max:   scalar ceiling for sigma weight (e.g. 0.3 → max 30% sigma)
-        k:            sigmoid steepness (default 10.0)
-        d0:           sigmoid midpoint (default 0.3)
-    Returns:
-        sigma weight matrix of same shape as inputs
-    """
-    disagreement = (T_sim - S_sim).abs()
-    if d0 == 'ma':
-        midpoint = disagreement.mean()
-    else:
-        midpoint = d0
-    gate = torch.sigmoid(k * (disagreement - midpoint))
-    return gate * lambda_max
-
 
 def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
                   labels, anchor_labels, sigma, lambda_soft, opt, eps=1e-7,
@@ -301,62 +251,35 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         sigma_ba = sigma_ba ** exponent
         sigma_ab = sigma_ab ** exponent
 
-    lambda_k    = getattr(opt, 'lambda_k',    10.0)
-    lambda_d0   = getattr(opt, 'lambda_d0',   0.3)
-    lambda_mode = getattr(opt, 'lambda_mode', 'rw')
+    lambda_k  = getattr(opt, 'lambda_k',  10.0)
+    lambda_d0 = getattr(opt, 'lambda_d0', 0.3)
+
+    d_L1 = pearson_distance_rows(b_teacher_sim, b_student_sim)      # [B]
+    d_L2 = pearson_distance_rows(a_teacher_sim, a_student_sim)      # [B]
+    d_L3 = pearson_distance_rows(a_teacher_sim_t, a_student_sim_t)  # [A]
+
+    if scaler is not None:
+        scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
+
+    k_mode  = getattr(opt, 'lambda_k_mode',  'static')
+    k_scale = getattr(opt, 'lambda_k_scale', 1.0)
+    d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
+    k0s = {k: k_scale / (scaler.d_std[k] + 1e-7) for k in ('L1', 'L2', 'L3')} if (scaler is not None and k_mode == 'auto') else {}
 
     stats = None
-    if lambda_mode == 'rw':
-        d_L1 = pearson_distance_rows(b_teacher_sim, b_student_sim)      # [B]
-        d_L2 = pearson_distance_rows(a_teacher_sim, a_student_sim)      # [B]
-        d_L3 = pearson_distance_rows(a_teacher_sim_t, a_student_sim_t)  # [A]
-
-        if scaler is not None:
-            scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
-
-        is_power = getattr(opt, 'lambda_fn', 'sigmoid') == 'power'
-        if is_power and scaler is not None:
-            # Power-function path: running-max normalization
-            lambda_alpha = getattr(opt, 'lambda_alpha', 1.0)
-            lam_L1_flat = compute_lambda_power(d_L1, scaler.d_max['L1'], lambda_alpha, lambda_soft)  # [B]
-            lam_L2_flat = compute_lambda_power(d_L2, scaler.d_max['L2'], lambda_alpha, lambda_soft)  # [B]
-            lam_L3_flat = compute_lambda_power(d_L3, scaler.d_max['L3'], lambda_alpha, lambda_soft)  # [A]
-            if return_stats:
-                stats = {'raw_L1': d_L1.detach(), 'raw_L2': d_L2.detach(), 'raw_L3': d_L3.detach(),
-                         'lam_L1': lam_L1_flat.detach(), 'lam_L2': lam_L2_flat.detach(), 'lam_L3': lam_L3_flat.detach()}
-            lam_L1 = lam_L1_flat.unsqueeze(1)  # [B, 1]
-            lam_L2 = lam_L2_flat.unsqueeze(1)  # [B, 1]
-            lam_L3 = lam_L3_flat.unsqueeze(1)  # [A, 1]
-        elif return_stats:
-            # Sigmoid path with stats collection
-            k_mode = getattr(opt, 'lambda_k_mode', 'static')
-            k_scale = getattr(opt, 'lambda_k_scale', 1.0)
-            d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
-            k0s = {k: k_scale / (scaler.d_std[k] + 1e-7) for k in ('L1', 'L2', 'L3')} if (scaler is not None and k_mode == 'auto') else {}
-            lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L1'), k_override=k0s.get('L1'))
-            lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L2'), k_override=k0s.get('L2'))
-            lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L3'), k_override=k0s.get('L3'))
-            stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
-                     'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
-            lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
-            lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
-            lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
-        else:
-            # Sigmoid path, normal
-            k_mode = getattr(opt, 'lambda_k_mode', 'static')
-            k_scale = getattr(opt, 'lambda_k_scale', 1.0)
-            d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
-            k0s = {k: k_scale / (scaler.d_std[k] + 1e-7) for k in ('L1', 'L2', 'L3')} if (scaler is not None and k_mode == 'auto') else {}
-            lam_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
-            lam_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
-            lam_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
-    else:  # 'cw'
-        lam_L1 = cell_wise_lambda(b_teacher_sim, b_student_sim,
-                                  lambda_soft, lambda_k, lambda_d0)   # [B, B]
-        lam_L2 = cell_wise_lambda(a_teacher_sim, a_student_sim,
-                                  lambda_soft, lambda_k, lambda_d0)   # [B, A]
-        lam_L3 = cell_wise_lambda(a_teacher_sim_t, a_student_sim_t,
-                                  lambda_soft, lambda_k, lambda_d0)   # [A, B]
+    if return_stats:
+        lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L1'), k_override=k0s.get('L1'))
+        lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L2'), k_override=k0s.get('L2'))
+        lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L3'), k_override=k0s.get('L3'))
+        stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
+                 'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
+        lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
+        lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
+        lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
+    else:
+        lam_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
+        lam_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
+        lam_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
 
     b_teacher_sim   = (1 - lam_L1) * b_teacher_sim   + lam_L1 * sigma_bb
     a_teacher_sim   = (1 - lam_L2) * a_teacher_sim   + lam_L2 * sigma_ba

@@ -212,22 +212,13 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     collect_tb  = use_soft and is_rw           # every epoch: AverageMeters for tensorboard
     collect_dis = collect_tb and (epoch % 5 == 0)  # every 5 epochs: full tensor lists for print
 
-    # Jump lambda_alpha to 1.5 at lock_epoch (power path only)
-    if scaler is not None:
-        opt.lambda_alpha = 1.5 if epoch >= scaler.lock_epoch else 1.0
-
     if collect_tb:
         dis_raw_meters = {k: AverageMeter() for k in ('L1', 'L2', 'L3')}
         dis_val_meters = {k: AverageMeter() for k in ('L1', 'L2', 'L3')}
 
-    is_power = getattr(opt, 'lambda_fn', 'sigmoid') == 'power'
     if collect_dis:
-        if is_power:
-            dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
-                                         'lam_L1', 'lam_L2', 'lam_L3')}
-        else:
-            dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
-                                         'gate_L1', 'gate_L2', 'gate_L3')}
+        dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
+                                     'gate_L1', 'gate_L2', 'gate_L3')}
 
     if use_gcn:
         from distiller_zoo.SoftAKD import soften_sigma_with_gcn
@@ -321,10 +312,9 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
             dis_stats = None
 
         if collect_tb and dis_stats is not None:
-            val_prefix = 'lam' if is_power else 'gate'
             for k in ('L1', 'L2', 'L3'):
                 raw_t = dis_stats[f'raw_{k}']
-                val_t = dis_stats[f'{val_prefix}_{k}']
+                val_t = dis_stats[f'gate_{k}']
                 dis_raw_meters[k].update(raw_t.mean().item(), raw_t.numel())
                 dis_val_meters[k].update(val_t.mean().item(), val_t.numel())
 
@@ -374,7 +364,6 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                    loss=losses, top1=top1, top5=top5))
             sys.stdout.flush()
 
-    # Power scaler: apply per-epoch EMA update
     if scaler is not None:
         scaler.step_epoch(epoch)
 
@@ -383,14 +372,10 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
         monitor_gcn(gcn, epoch, n_cls, sigma=sigma,
                     alpha=opt.alpha_soft, snapshot_store=snapshot_store)
 
-    # Disagreement stats every 5 epochs (rw mode only)
+    # Disagreement stats every 5 epochs
     if collect_dis and any(len(v) > 0 for v in dis_accum.values()):
-        if is_power:
-            from distiller_zoo.SoftAKD2 import print_disagreement_stats_power
-            print_disagreement_stats_power(dis_accum, epoch, opt, scaler.d_max)
-        else:
-            from distiller_zoo.SoftAKD2 import print_disagreement_stats
-            print_disagreement_stats(dis_accum, epoch, opt, scaler=scaler)
+        from distiller_zoo.SoftAKD2 import print_disagreement_stats
+        print_disagreement_stats(dis_accum, epoch, opt, scaler=scaler)
 
     # Build tensorboard stats dict (every epoch)
     dis_tb_stats = None
@@ -401,15 +386,11 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
             'dis_raw_L2': dis_raw_meters['L2'].avg,
             'dis_raw_L3': dis_raw_meters['L3'].avg,
         }
-        if is_power:
-            for k in ('L1', 'L2', 'L3'):
-                dis_tb_stats[f'lam_pct_{k}'] = 100.0 * dis_val_meters[k].avg / lambda_soft
-                dis_tb_stats[f'run_dmax_{k}'] = scaler.d_max[k]
-        else:
-            for k in ('L1', 'L2', 'L3'):
-                dis_tb_stats[f'avg_gate_{k}'] = dis_val_meters[k].avg
+        for k in ('L1', 'L2', 'L3'):
+            dis_tb_stats[f'avg_gate_{k}'] = dis_val_meters[k].avg
+            if scaler is not None:
                 dis_tb_stats[f'd_mean_{k}'] = scaler.d_mean[k]
-                dis_tb_stats[f'd_std_{k}'] = scaler.d_std[k]
+                dis_tb_stats[f'd_std_{k}']  = scaler.d_std[k]
 
     return top1.avg, top5.avg, losses.avg, loss_G_meter.avg, loss_akd_meter.avg, dis_tb_stats
 
