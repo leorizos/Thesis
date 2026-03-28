@@ -75,6 +75,8 @@ def parse_option():
     parser.add_argument('--sigma_temp', type=float, default=1.0, help='temperature for sharpening sigma (< 1.0 sharpens)')
     parser.add_argument('--sigma_path', type=str, default='save/class_similarity_matrix.npy',
                         help='path to class similarity matrix for soft PKT v2')
+    parser.add_argument('--sigma_mode', type=str, default='precomputed', choices=['precomputed', 'student'],
+                        help='Soft AKD sigma source: precomputed matrix (default) or student batch similarities')
 
     # AKD (Anchor-based Knowledge Distillation)
     parser.add_argument('--l_1', type=float, default=1.0, help='AKD: weight for intra-batch KL (L_1)')
@@ -88,14 +90,14 @@ def parse_option():
     parser.add_argument('--sigma_s_mode', type=str, default='ab', choices=['ab', 'aa', 'bb'],
                         help='Soft AKD: how to compute Sigma_s for GCN training. '
                              'ab=batch-to-anchor (default), aa=anchor-to-anchor, bb=batch-to-batch')
-    parser.add_argument('--lambda_k', type=float, default=10.0,
-                        help='Soft AKD adaptive lambda: sigmoid steepness (default 10.0, used when lambda_k_mode=static)')
-    parser.add_argument('--lambda_k_mode', type=str, default='static', choices=['static', 'auto'],
-                        help='Soft AKD sigmoid steepness mode: static (fixed lambda_k) or auto (lambda_k_scale/std, default static)')
-    parser.add_argument('--lambda_k_scale', type=float, default=1.0,
-                        help='Soft AKD auto steepness numerator: k = lambda_k_scale / std (default 1.0, used when lambda_k_mode=auto)')
     parser.add_argument('--lambda_d0', type=lambda x: x if x == 'ma' else float(x), default=0.3,
                         help='Soft AKD adaptive lambda: sigmoid midpoint. Float (e.g. 0.3) uses static normalised d0; "ma" uses per-batch mean disagreement (default 0.3)')
+    parser.add_argument('--scaler_update_freq', type=str, default='epoch', choices=['epoch', 'batch'],
+                        help='Soft AKD disagreement scaler EMA update frequency: epoch (default) or batch')
+    parser.add_argument('--batch_momentum', type=float, default=0.999,
+                        help='Soft AKD per-batch EMA momentum (default 0.999, used when scaler_update_freq=batch)')
+    parser.add_argument('--lock_std_only', action='store_true',
+                        help='Soft AKD: freeze only d_std (k=scale/std) at lock_epoch; d_mean continues updating')
     parser.add_argument('--tag', type=str, default='',
                         help='Optional tag appended to model name for run identification')
 
@@ -145,23 +147,25 @@ def parse_option():
     opt.model_name = model_name_template.format(opt.model_s, opt.model_t, opt.dataset, opt.distill,
                                                 opt.cls, opt.div, opt.beta, opt.trial)
     if opt.distill == 'soft_akd':
-        lm = getattr(opt, 'lambda_mode', 'cw')
+        lm = getattr(opt, 'lambda_mode', 'rw')
         if getattr(opt, 'no_gcn', False):
             opt.model_name += '_l_{}_{}_nogcn'.format(opt.lambda_soft, lm)
         else:
             opt.model_name += '_l_{}_{}_a_{}_glr_{}'.format(opt.lambda_soft, lm, opt.alpha_soft, opt.gcn_lr)
         if opt.lambda_d0 == 'ma':
             opt.model_name += '_d0ma'
-        if opt.sigma_temp != 1.0:
+        if opt.sigma_mode == 'student':
+            opt.model_name += '_sigstu'
+        if opt.sigma_temp != 1.0 and opt.sigma_mode != 'student':
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
         if opt.sigma_s_mode != 'ab':
             opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
-        if opt.lambda_k_mode == 'auto':
-            opt.model_name += '_ks_{}'.format(opt.lambda_k_scale)
-        elif opt.lambda_k != 10.0:
-            opt.model_name += '_lk_{}'.format(opt.lambda_k)
         if opt.lambda_d0 != 0.3 and opt.lambda_d0 != 'ma':
             opt.model_name += '_ld_{}'.format(opt.lambda_d0)
+        if opt.scaler_update_freq == 'batch':
+            opt.model_name += '_upb'
+        if opt.lock_std_only:
+            opt.model_name += '_lkstd'
     if opt.tag:
         opt.model_name += '_{}'.format(opt.tag)
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
@@ -511,26 +515,29 @@ def main_worker(gpu, ngpus_per_node, opt):
 
         # Soft AKD: load class similarity matrix and create anchor labels
         if opt.distill == 'soft_akd':
-            import numpy as np
-            if not os.path.exists(opt.sigma_path):
-                raise FileNotFoundError(
-                    f"Class similarity matrix not found at {opt.sigma_path}. "
-                    f"Please run compute_class_similarity_matrix.py first."
-                )
-            sigma_np = np.load(opt.sigma_path)
             gpu_device = opt.gpu if opt.multiprocessing_distributed else 0
-            sigma = torch.from_numpy(sigma_np).float().cuda(gpu_device)
-            # anchors_per_class=1, selected in class order → anchor i = class i
             anchor_labels = torch.arange(n_cls).cuda(gpu_device)
-            print(f'    Soft AKD: sigma loaded from {opt.sigma_path}')
-            print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
-            print(f'    Soft AKD: sigma_temp = {opt.sigma_temp}')
-            if not getattr(opt, 'no_gcn', False):
+            if opt.sigma_mode == 'student':
+                print(f'    Soft AKD: sigma_mode=student (using batch student similarities)')
+                print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
+            else:
+                import numpy as np
+                if not os.path.exists(opt.sigma_path):
+                    raise FileNotFoundError(
+                        f"Class similarity matrix not found at {opt.sigma_path}. "
+                        f"Please run compute_class_similarity_matrix.py first."
+                    )
+                sigma_np = np.load(opt.sigma_path)
+                sigma = torch.from_numpy(sigma_np).float().cuda(gpu_device)
+                print(f'    Soft AKD: sigma loaded from {opt.sigma_path}')
+                print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
+                print(f'    Soft AKD: sigma_temp = {opt.sigma_temp}')
+            if opt.sigma_mode != 'student' and not getattr(opt, 'no_gcn', False):
                 gcn = GCN(num_classes=n_cls).cuda(gpu_device)
                 optimizer_gcn = torch.optim.Adam(gcn.parameters(), lr=opt.gcn_lr)
                 print(f'    Soft AKD: GCN initialised ({n_cls}x{n_cls})')
                 print(f'    Soft AKD: GCN lr = {opt.gcn_lr}, alpha_soft = {opt.alpha_soft}')
-            else:
+            elif opt.sigma_mode != 'student':
                 print(f'    Soft AKD: GCN disabled (--no_gcn), using raw sigma only')
 
     # GCN diagnostic collectors (only used when distill == 'soft_akd' with GCN)
@@ -540,7 +547,11 @@ def main_worker(gpu, ngpus_per_node, opt):
     dis_scaler = None
     if opt.distill == 'soft_akd' and getattr(opt, 'lambda_mode', 'rw') == 'rw':
         from distiller_zoo.SoftAKD import DisagreementScaler
-        dis_scaler = DisagreementScaler()
+        dis_scaler = DisagreementScaler(
+            per_batch=opt.scaler_update_freq == 'batch',
+            batch_momentum=opt.batch_momentum,
+            lock_std_only=opt.lock_std_only,
+        )
     gcn_loss_G_history = []
     gcn_loss_akd_history = []
 
@@ -593,8 +604,8 @@ def main_worker(gpu, ngpus_per_node, opt):
                 for key, val in dis_tb_stats.items():
                     logger.log_value(key, val, epoch)
 
-        # Validate every 3 epochs or on the last epoch
-        if epoch % 3 == 0 or epoch == opt.epochs:
+        # Validate every 2 epochs or on the last epoch
+        if epoch % 2 == 0 or epoch == opt.epochs:
             print('GPU %d validating' % (opt.gpu))
             test_acc, test_acc_top5, test_loss = validate_distill(val_loader, module_list, criterion_cls, opt)
 

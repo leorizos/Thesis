@@ -6,29 +6,36 @@ import torch.nn.functional as F
 
 
 class DisagreementScaler:
-    """Tracks per-term Pearson disagreement scale for power-law normalization.
+    """Tracks per-term Pearson disagreement statistics (mean, std, max) via EMA.
 
-    Per batch: tracks the epoch's running max in a scratch buffer.
-    Per epoch: applies EMA of (momentum * d_max + (1-momentum) * epoch_max),
-               then resets the scratch buffer.
-    After lock_epoch: d_max is frozen, no further updates.
+    Supports two update frequencies:
+      per_batch=False (default): EMA updated once per epoch from epoch aggregates.
+      per_batch=True:            EMA updated every mini-batch using batch statistics.
+    After lock_epoch: all stats are frozen, no further updates.
 
-    This avoids a single outlier batch locking d_max permanently while still
-    providing a stable, slowly-adapting normalizer across training.
+    lock_std_only=True: only d_std is locked at lock_epoch (for k computation).
+      d_mean continues to update. d_std keeps tracking for display but k uses
+      the snapshotted d_std_locked value from lock_epoch onward.
     """
-    def __init__(self, init=0.1, momentum=0.99, lock_epoch=150):
-        self.d_max      = {'L1': init, 'L2': init, 'L3': init}
-        self.d_mean     = {'L1': init, 'L2': init, 'L3': init}
-        self.momentum   = momentum
-        self.lock_epoch = lock_epoch
-        self._epoch_max = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
-        self._epoch_sum = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
-        self._epoch_n   = {'L1': 0,    'L2': 0,    'L3': 0}
-        self.d_std      = {'L1': init, 'L2': init, 'L3': init}
-        self._epoch_sq  = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+    def __init__(self, init=0.1, momentum=0.99, lock_epoch=240,
+                 per_batch=False, batch_momentum=0.999, lock_std_only=False):
+        self.d_max          = {'L1': init, 'L2': init, 'L3': init}
+        self.d_mean         = {'L1': init, 'L2': init, 'L3': init}
+        self.d_std          = {'L1': init, 'L2': init, 'L3': init}
+        self.d_std_locked   = None   # set at lock_epoch when lock_std_only=True
+        self.momentum       = momentum
+        self.lock_epoch     = lock_epoch
+        self.lock_std_only  = lock_std_only
+        self.per_batch      = per_batch
+        self.batch_momentum = batch_momentum
+        self._current_epoch = 0
+        self._epoch_max     = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+        self._epoch_sum     = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+        self._epoch_n       = {'L1': 0,    'L2': 0,    'L3': 0}
+        self._epoch_sq      = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
 
     def update(self, d_L1, d_L2, d_L3):
-        """Track per-batch max into epoch scratch buffer. Call once per batch."""
+        """Call once per batch. Updates stats either per-batch or accumulates for epoch."""
         for key, d in [('L1', d_L1), ('L2', d_L2), ('L3', d_L3)]:
             batch_max = d.max().item()
             if batch_max > self._epoch_max[key]:
@@ -37,28 +44,51 @@ class DisagreementScaler:
             self._epoch_n[key]   += d.numel()
             self._epoch_sq[key]  += (d ** 2).sum().item()
 
-    def step_epoch(self, epoch):
-        """Apply EMA update from this epoch's max, then reset scratch. Call once per epoch.
+            if self.per_batch:
+                update_mean = self._current_epoch <= self.lock_epoch or self.lock_std_only
+                update_std  = self._current_epoch <= self.lock_epoch or self.lock_std_only
+                if update_mean or update_std or self._current_epoch <= self.lock_epoch:
+                    m = self.batch_momentum
+                    batch_mean = d.mean().item()
+                    batch_var  = (d ** 2).mean().item() - batch_mean ** 2
+                    batch_std  = max(batch_var, 0.0) ** 0.5
+                    if update_mean:
+                        self.d_mean[key] = m * self.d_mean[key] + (1 - m) * batch_mean
+                    if update_std:
+                        self.d_std[key]  = m * self.d_std[key]  + (1 - m) * batch_std
+                    if self._current_epoch <= self.lock_epoch and batch_max > self.d_max[key]:
+                        self.d_max[key] = m * self.d_max[key] + (1 - m) * batch_max
 
-        Epoch 1: hard update to set a real baseline (avoids init=0.1 saturation).
-        Epochs 2-lock_epoch: EMA smoothing.
-        After lock_epoch: d_max frozen.
+    def step_epoch(self, epoch):
+        """Call once per epoch. Handles epoch-level EMA (if per_batch=False) and lock.
+
+        lock_std_only=True: d_mean updates every epoch; d_std also continues tracking
+        for monitoring, but d_std_locked is snapshotted at lock_epoch for k computation.
         """
-        if epoch <= self.lock_epoch:
+        self._current_epoch = epoch
+        if not self.per_batch:
             if epoch == 1:
-                # Hard update: set d_max directly from first epoch's observed max
                 for key in self.d_max:
-                    self.d_max[key] = self._epoch_max[key]
+                    self.d_max[key]  = self._epoch_max[key]
                     self.d_mean[key] = self._epoch_sum[key] / self._epoch_n[key]
-                    self.d_std[key] = (self._epoch_sq[key] / self._epoch_n[key] - self.d_mean[key] ** 2) ** 0.5
+                    self.d_std[key]  = (self._epoch_sq[key] / self._epoch_n[key] - self.d_mean[key] ** 2) ** 0.5
             else:
                 m = 0.9 if epoch <= 20 else self.momentum
                 for key in self.d_max:
-                    self.d_max[key] = m * self.d_max[key] + (1 - m) * self._epoch_max[key]
                     epoch_mean = self._epoch_sum[key] / self._epoch_n[key]
-                    self.d_mean[key] = m * self.d_mean[key] + (1 - m) * epoch_mean
-                    epoch_std = (self._epoch_sq[key] / self._epoch_n[key] - epoch_mean ** 2) ** 0.5
-                    self.d_std[key] = m * self.d_std[key] + (1 - m) * epoch_std
+                    epoch_std  = (self._epoch_sq[key] / self._epoch_n[key] - epoch_mean ** 2) ** 0.5
+                    # d_max: always lock at lock_epoch
+                    if epoch <= self.lock_epoch:
+                        self.d_max[key]  = m * self.d_max[key]  + (1 - m) * self._epoch_max[key]
+                    # d_mean: update always if lock_std_only, else until lock_epoch
+                    if self.lock_std_only or epoch <= self.lock_epoch:
+                        self.d_mean[key] = m * self.d_mean[key] + (1 - m) * epoch_mean
+                    # d_std: update always for tracking (k uses d_std_locked after lock)
+                    if self.lock_std_only or epoch <= self.lock_epoch:
+                        self.d_std[key]  = m * self.d_std[key]  + (1 - m) * epoch_std
+            # Snapshot d_std at lock_epoch for k computation
+            if self.lock_std_only and epoch == self.lock_epoch and self.d_std_locked is None:
+                self.d_std_locked = {k: v for k, v in self.d_std.items()}
         self._epoch_max = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
         self._epoch_sum = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
         self._epoch_n   = {'L1': 0,   'L2': 0,   'L3': 0}
@@ -238,20 +268,26 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     b_student_sim = (torch.mm(output_net, torch.t(output_net)) + 1) / 2        # [B, B]
     b_teacher_sim = (torch.mm(target_net, torch.t(target_net)) + 1) / 2        # [B, B]
 
-    # ===== SOFTENING: Blend teacher similarities with class-level sigma =====
-    sigma_bb = sigma[labels][:, labels]              # [B, B]
-    sigma_ba = sigma[labels][:, anchor_labels]       # [B, A]
-    sigma_ab = sigma[anchor_labels][:, labels]       # [A, B]
+    # ===== SOFTENING: Blend teacher similarities with sigma target =====
+    if sigma is None:
+        # Student mode: use student's own batch similarities as the blend target
+        sigma_bb = b_student_sim.detach()  # [B, B]
+        sigma_ba = a_student_sim.detach()  # [B, A]
+        sigma_ab = a_student_sim_t.detach()  # [A, B]
+    else:
+        # Precomputed sigma mode
+        sigma_bb = sigma[labels][:, labels]              # [B, B]
+        sigma_ba = sigma[labels][:, anchor_labels]       # [B, A]
+        sigma_ab = sigma[anchor_labels][:, labels]       # [A, B]
 
-    # Temperature sharpening: sigma ^ (1/T), T < 1 sharpens contrast
-    sigma_temp = getattr(opt, 'sigma_temp', 1.0)
-    if sigma_temp != 1.0:
-        exponent = 1.0 / sigma_temp
-        sigma_bb = sigma_bb ** exponent
-        sigma_ba = sigma_ba ** exponent
-        sigma_ab = sigma_ab ** exponent
+        # Temperature sharpening: sigma ^ (1/T), T < 1 sharpens contrast
+        sigma_temp = getattr(opt, 'sigma_temp', 1.0)
+        if sigma_temp != 1.0:
+            exponent = 1.0 / sigma_temp
+            sigma_bb = sigma_bb ** exponent
+            sigma_ba = sigma_ba ** exponent
+            sigma_ab = sigma_ab ** exponent
 
-    lambda_k  = getattr(opt, 'lambda_k',  10.0)
     lambda_d0 = getattr(opt, 'lambda_d0', 0.3)
 
     d_L1 = pearson_distance_rows(b_teacher_sim, b_student_sim)      # [B]
@@ -261,25 +297,27 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     if scaler is not None:
         scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
 
-    k_mode  = getattr(opt, 'lambda_k_mode',  'static')
-    k_scale = getattr(opt, 'lambda_k_scale', 1.0)
     d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
-    k0s = {k: k_scale / (scaler.d_std[k] + 1e-7) for k in ('L1', 'L2', 'L3')} if (scaler is not None and k_mode == 'auto') else {}
+    if scaler is not None:
+        d_std_for_k = scaler.d_std_locked if scaler.d_std_locked is not None else scaler.d_std
+        k0s = {k: 1.0 / (d_std_for_k[k] + 1e-7) for k in ('L1', 'L2', 'L3')}
+    else:
+        k0s = {}
 
     stats = None
     if return_stats:
-        lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L1'), k_override=k0s.get('L1'))
-        lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L2'), k_override=k0s.get('L2'))
-        lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, return_stats=True, d0_override=d0s.get('L3'), k_override=k0s.get('L3'))
+        lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
+        lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
+        lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
         stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
                  'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
         lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
         lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
         lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
     else:
-        lam_L1 = adaptive_lambda(d_L1, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
-        lam_L2 = adaptive_lambda(d_L2, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
-        lam_L3 = adaptive_lambda(d_L3, lambda_soft, lambda_k, lambda_d0, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
+        lam_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
+        lam_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
+        lam_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
 
     b_teacher_sim   = (1 - lam_L1) * b_teacher_sim   + lam_L1 * sigma_bb
     a_teacher_sim   = (1 - lam_L2) * a_teacher_sim   + lam_L2 * sigma_ba

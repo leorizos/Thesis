@@ -124,16 +124,15 @@ def print_disagreement_stats(accum, epoch, opt, scaler=None):
     All values are flat CPU tensors concatenated across all batches.
     """
     lambda_d0   = getattr(opt, 'lambda_d0',   0.3)
-    lambda_k    = getattr(opt, 'lambda_k',    10.0)
     lambda_soft = getattr(opt, 'lambda_soft', 0.3)
     save_folder = getattr(opt, 'save_folder', None)
 
-    d_mean   = scaler.d_mean if scaler is not None else None
-    d_std    = scaler.d_std  if scaler is not None else None
-    d0_src   = 'tracked' if d_mean is not None else str(lambda_d0)
-    k_mode   = getattr(opt, 'lambda_k_mode',  'static')
-    k_scale  = getattr(opt, 'lambda_k_scale', 1.0)
-    k_src    = f'{k_scale}/std' if k_mode == 'auto' else str(lambda_k)
+    d_mean       = scaler.d_mean       if scaler is not None else None
+    d_std        = scaler.d_std        if scaler is not None else None
+    d_std_locked = scaler.d_std_locked if scaler is not None else None
+    d0_src  = 'tracked' if d_mean is not None else str(lambda_d0)
+    k_locked = d_std_locked is not None
+    k_src   = f'1/std{"*" if k_locked else ""}'
 
     lines = []
     lines.append("\n" + "=" * 80)
@@ -158,7 +157,9 @@ def print_disagreement_stats(accum, epoch, opt, scaler=None):
         pct_low   = 100.0 * (gate < 0.1).float().mean().item()
         dmean_val = d_mean[dkey] if d_mean is not None else float('nan')
         dstd_val  = d_std[dkey]  if d_std  is not None else float('nan')
-        k_eff_val = k_scale / (dstd_val + 1e-7) if (d_std is not None and k_mode == 'auto') else lambda_k
+        # k uses locked std if snapshotted, else current std
+        dstd_for_k = d_std_locked[dkey] if d_std_locked is not None else dstd_val
+        k_eff_val = 1.0 / (dstd_for_k + 1e-7) if d_std is not None else float('nan')
         lines.append(f"{label:<10} {avg_raw:>10.4f} {dmean_val:>8.4f} {dstd_val:>7.4f} {k_eff_val:>7.2f} {avg_gate:>9.4f} "
                      f"{pct_pass:>8.1f}% {pct_high:>8.1f}% {pct_low:>8.1f}%")
 

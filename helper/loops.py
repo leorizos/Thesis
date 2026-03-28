@@ -206,7 +206,8 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     from distiller_zoo.SoftAKD import soft_akd_loss
     import torch.nn.functional as F
 
-    use_soft = sigma is not None and anchor_labels is not None
+    use_soft = (sigma is not None and anchor_labels is not None) or \
+               getattr(opt, 'sigma_mode', 'precomputed') == 'student'
     use_gcn = gcn is not None and optimizer_gcn is not None
     is_rw = getattr(opt, 'lambda_mode', 'rw') == 'rw'
     collect_tb  = use_soft and is_rw           # every epoch: AverageMeters for tensorboard
@@ -286,7 +287,8 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
         loss_div = criterion_div(logit_s, logit_t)
 
         loss_G = None
-        if use_soft and use_gcn:
+        is_student_mode = getattr(opt, 'sigma_mode', 'precomputed') == 'student'
+        if use_soft and use_gcn and not is_student_mode:
             # Soften sigma using GCN
             sigma_soft, loss_G = soften_sigma_with_gcn(
                 sigma, feat_teacher, feat_student,
@@ -294,16 +296,16 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                 labels, anchor_labels, gcn, alpha=opt.alpha_soft,
                 sigma_s_mode=getattr(opt, 'sigma_s_mode', 'ab')
             )
-            # Use softened sigma in existing soft_akd_loss
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_soft,
                                      opt.lambda_soft, opt, return_stats=collect_tb,
                                      scaler=scaler)
         elif use_soft:
+            sigma_in = None if is_student_mode else sigma
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
-                                     labels, anchor_labels, sigma,
+                                     labels, anchor_labels, sigma_in,
                                      opt.lambda_soft, opt, return_stats=collect_tb,
                                      scaler=scaler)
         else:
