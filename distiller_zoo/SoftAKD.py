@@ -325,19 +325,8 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     d_L2 = pearson_distance_rows(a_teacher_sim, a_student_sim)      # [B]
     d_L3 = pearson_distance_rows(a_teacher_sim_t, a_student_sim_t)  # [A]
 
-    cell_wise = getattr(opt, 'cell_wise', False)
-
-    if cell_wise:
-        # Outer products: cell [i,j] = d_i * d_j using the appropriate row/col distances
-        cell_L1 = d_L1.detach()[:, None] * d_L1.detach()[None, :]  # [B, B]
-        cell_L2 = d_L2.detach()[:, None] * d_L3.detach()[None, :]  # [B, A]
-        cell_L3 = d_L3.detach()[:, None] * d_L2.detach()[None, :]  # [A, B]
-
     if scaler is not None:
-        if cell_wise:
-            scaler.update(cell_L1.reshape(-1), cell_L2.reshape(-1), cell_L3.reshape(-1))
-        else:
-            scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
+        scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
 
     if scaler is not None:
         d_mean_src = scaler.d_mean_locked if scaler.d_mean_locked is not None else scaler.d_mean
@@ -351,33 +340,19 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         k0s = {}
 
     stats = None
-    if cell_wise:
-        if return_stats:
-            lam_L1, _, gate_L1 = adaptive_lambda(cell_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
-            lam_L2, _, gate_L2 = adaptive_lambda(cell_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
-            lam_L3, _, gate_L3 = adaptive_lambda(cell_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
-            # Stats: keep row-wise raw distances for monitoring; average gate across columns
-            stats = {'raw_L1': d_L1.detach(), 'raw_L2': d_L2.detach(), 'raw_L3': d_L3.detach(),
-                     'gate_L1': gate_L1.mean(dim=1), 'gate_L2': gate_L2.mean(dim=1), 'gate_L3': gate_L3.mean(dim=1)}
-        else:
-            lam_L1 = adaptive_lambda(cell_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'))
-            lam_L2 = adaptive_lambda(cell_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'))
-            lam_L3 = adaptive_lambda(cell_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'))
-        # lam_L1: [B,B], lam_L2: [B,A], lam_L3: [A,B] — no unsqueeze, blending is element-wise
+    if return_stats:
+        lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
+        lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
+        lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
+        stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
+                 'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
+        lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
+        lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
+        lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
     else:
-        if return_stats:
-            lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
-            lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
-            lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
-            stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
-                     'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
-            lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
-            lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
-            lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
-        else:
-            lam_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
-            lam_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
-            lam_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
+        lam_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
+        lam_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
+        lam_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
 
     b_teacher_sim   = (1 - lam_L1) * b_teacher_sim   + lam_L1 * sigma_bb
     a_teacher_sim   = (1 - lam_L2) * a_teacher_sim   + lam_L2 * sigma_ba
