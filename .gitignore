@@ -18,6 +18,16 @@ nul
 # Scratch notebooks
 *.ipynb
 
+# Personal / thesis writing files (not part of the codebase)
+thesis.yml
+report.md
+
+# One-off scripts not intended for the repo
+train_teacher_vit.py
+
+# Entire NORM-main reference folder (read-only reference, not our code)
+NORM-main/
+
 # The save/ directory has its own .gitignore which excludes:
 # - model weights (*.pth)
 # - numpy arrays (*.npy, *.pt)

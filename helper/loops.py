@@ -1,9 +1,10 @@
 from __future__ import print_function, division
-from cProfile import label
 
 import sys
 import time
+import heapq
 import torch
+import torch.nn.functional as F
 from .util import AverageMeter, accuracy, reduce_tensor
 
 def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
@@ -56,6 +57,22 @@ def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
             sys.stdout.flush()
             
     return top1.avg, top5.avg, losses.avg
+
+def _norm_beta1(epoch, dataset):
+    """Dynamic beta1 schedule for NORM distillation."""
+    if dataset == 'cifar100':
+        if epoch < 10:   return 0.1
+        if epoch < 20:   return 0.5
+        if epoch < 180:  return 1.0
+        if epoch < 210:  return 0.5
+        return 0.1
+    else:  # imagenet
+        if epoch < 5:    return 0.1
+        if epoch < 15:   return 0.5
+        if epoch < 60:   return 0.9
+        if epoch < 80:   return 0.5
+        return 0.1
+
 
 def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, opt, g=None, g_opt=None):
     """one epoch distillation"""
@@ -145,10 +162,30 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
             f_s = feat_s[-1]
             f_t = feat_t[-1]
             loss_kd = criterion_kd(f_s, f_t)
-        elif opt.distill == 'soft_pkt2':
+        elif opt.distill == 'rkd':
             f_s = feat_s[-1]
             f_t = feat_t[-1]
-            loss_kd = criterion_kd(f_s, f_t, labels)
+            loss_kd = criterion_kd(f_s, f_t)
+        elif opt.distill in ('ttm', 'wttm'):
+            loss_kd = criterion_kd(logit_s, logit_t)
+        elif opt.distill == 'norm':
+            # Logit normalization (overrides loss_cls / loss_div computed above)
+            n_cls = logit_s.size(1)
+            logit_s_n = F.layer_norm(logit_s, (n_cls,), eps=1e-7) * opt.ceta
+            logit_t_n = F.layer_norm(logit_t, (n_cls,), eps=1e-7) * opt.ceta
+            loss_cls = criterion_cls(logit_s_n, labels)
+            loss_div = criterion_div(logit_s_n, logit_t_n)
+            # Feature MSE loss with channel expansion
+            norm_connector = module_list[1]
+            f_s_raw = feat_s[-2]
+            f_t_raw = feat_t[-2]
+            pool_size = f_t_raw.shape[2] // f_s_raw.shape[2]
+            if pool_size > 1:
+                f_t_raw = F.max_pool2d(f_t_raw, pool_size, pool_size)
+            f_s = norm_connector(f_s_raw)
+            f_t = f_t_raw.repeat(1, opt.co_sponge, 1, 1)
+            beta1 = _norm_beta1(epoch, opt.dataset)
+            loss_kd = beta1 * F.mse_loss(f_s, f_t.detach()) * opt.co_sponge
         else:
             raise NotImplementedError(opt.distill)
 
@@ -181,11 +218,89 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
     return top1.avg, top5.avg, losses.avg
 
 
+DIST_SNAPSHOT_EPOCHS   = {30, 150, 180, 240}
+HARDEST_SNAPSHOT_EPOCHS = {30, 150, 180, 240}
+
+
+CIFAR100_CLASSES = [
+    'apple', 'aquarium_fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle',
+    'bicycle', 'bottle', 'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel',
+    'can', 'castle', 'caterpillar', 'cattle', 'chair', 'chimpanzee', 'clock',
+    'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur',
+    'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster',
+    'house', 'kangaroo', 'keyboard', 'lamp', 'lawn_mower', 'leopard', 'lion',
+    'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain', 'mouse',
+    'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear',
+    'pickup_truck', 'pine_tree', 'plain', 'plate', 'poppy', 'porcupine',
+    'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket', 'rose', 'sea',
+    'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake',
+    'spider', 'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table',
+    'tank', 'telephone', 'television', 'tiger', 'tractor', 'train', 'trout',
+    'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman',
+    'worm',
+]
+
+
+def _unnormalize_cifar(img_tensor):
+    """Undo CIFAR-100 normalization for display. [C,H,W] float → [H,W,C] numpy in [0,1]."""
+    mean = torch.tensor([0.5071, 0.4867, 0.4408]).view(3, 1, 1)
+    std  = torch.tensor([0.2675, 0.2565, 0.2761]).view(3, 1, 1)
+    return (img_tensor * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+
+
+def save_hardest_samples(epoch, hardest_top, hardest_bot, save_folder):
+    """Save a 2x5 grid: top row = 5 highest L1 disagreement, bottom row = 5 lowest.
+
+    Args:
+        epoch:       Current epoch number
+        hardest_top: min-heap of (d,  counter, img_cpu [C,H,W], label) — 5 highest d
+        hardest_bot: min-heap of (-d, counter, img_cpu [C,H,W], label) — 5 lowest d
+        save_folder: Directory where the PNG is saved
+    """
+    import os
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # Sort: highest d first for top, lowest d first for bot
+    top_sorted = sorted(hardest_top, key=lambda x: -x[0])
+    bot_sorted = sorted(hardest_bot, key=lambda x:  x[0])  # ascending -d = ascending d...
+    # bot stored as (-d,...): sort by x[0] ascending = most negative first = largest d first
+    # we want lowest d first, so sort descending by x[0] (least negative = smallest d first)
+    bot_sorted = sorted(hardest_bot, key=lambda x: -x[0])
+
+    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+    for col in range(5):
+        for row, (samples, row_label, sign) in enumerate([
+            (top_sorted, 'Hardest',  1),
+            (bot_sorted, 'Easiest', -1),
+        ]):
+            ax = axes[row, col]
+            if col >= len(samples):
+                ax.axis('off')
+                continue
+            stored_d, _, img_tensor, label = samples[col]
+            dis_val = stored_d * sign  # undo negation for easiest row
+            img_np  = _unnormalize_cifar(img_tensor)
+            ax.imshow(img_np)
+            ax.set_title(f'{CIFAR100_CLASSES[label]}\nL1={dis_val:.3f}', fontsize=8)
+            ax.axis('off')
+            if col == 0:
+                ax.set_ylabel(row_label, fontsize=9)
+
+    fig.suptitle(f'Hardest vs Easiest Samples (L1 disagreement) — Epoch {epoch}', fontsize=11)
+    fig.tight_layout()
+    out_path = os.path.join(save_folder, f'hardest_samples_epoch{epoch}.png')
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'[SoftAKD] Saved hardest/easiest samples → {out_path}')
+
+
 def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                       criterion_list, optimizer, optimizer_anchor, opt, a_feat_t,
                       sigma=None, anchor_labels=None,
                       gcn=None, optimizer_gcn=None, snapshot_store=None,
-                      scaler=None):
+                      scaler=None, dist_snapshot_store=None):
     """One epoch of Anchor-based Knowledge Distillation (AKD / Soft AKD).
 
     AKD introduces learnable anchor images whose spatial attention is optimised
@@ -209,9 +324,11 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     use_soft = (sigma is not None and anchor_labels is not None) or \
                getattr(opt, 'sigma_mode', 'precomputed') == 'student'
     use_gcn = gcn is not None and optimizer_gcn is not None
-    is_rw = getattr(opt, 'lambda_mode', 'rw') == 'rw'
+    is_rw = getattr(opt, 'lambda_mode', 'rw') in ('rw', 'cw')
     collect_tb  = use_soft and is_rw           # every epoch: AverageMeters for tensorboard
     collect_dis = collect_tb and (epoch % 5 == 0)  # every 5 epochs: full tensor lists for print
+    collect_dist_snap  = (dist_snapshot_store is not None and epoch in DIST_SNAPSHOT_EPOCHS)
+    collect_hardest    = use_soft and is_rw and epoch in HARDEST_SNAPSHOT_EPOCHS
 
     if collect_tb:
         dis_raw_meters = {k: AverageMeter() for k in ('L1', 'L2', 'L3')}
@@ -220,6 +337,14 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     if collect_dis:
         dis_accum = {k: [] for k in ('raw_L1', 'raw_L2', 'raw_L3',
                                      'gate_L1', 'gate_L2', 'gate_L3')}
+
+    if collect_dist_snap:
+        dist_snap_accum = {'L1': [], 'L2': [], 'L3': []}
+
+    if collect_hardest:
+        hardest_top = []   # min-heap (d, counter, img, label)  — tracks 5 highest d
+        hardest_bot = []   # min-heap (-d, counter, img, label) — tracks 5 lowest d
+        _hctr = 0          # unique counter to break ties without comparing tensors
 
     if use_gcn:
         from distiller_zoo.SoftAKD import soften_sigma_with_gcn
@@ -324,6 +449,30 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
             for k in dis_accum:
                 dis_accum[k].append(dis_stats[k].cpu())
 
+        if collect_dist_snap and dis_stats is not None:
+            for k in ('L1', 'L2', 'L3'):
+                dist_snap_accum[k].append(dis_stats[f'raw_{k}'].cpu())
+
+        if collect_hardest and dis_stats is not None:
+            batch_dis  = dis_stats['raw_L1'].cpu()   # [B]
+            batch_imgs = images.cpu()                 # [B, C, H, W]
+            batch_lbls = labels.cpu()                 # [B]
+            for i in range(batch_dis.size(0)):
+                d   = batch_dis[i].item()
+                img = batch_imgs[i]
+                lbl = batch_lbls[i].item()
+                _hctr += 1
+                # top-5 highest: min-heap, replace smallest when new d is larger
+                if len(hardest_top) < 5:
+                    heapq.heappush(hardest_top, (d, _hctr, img, lbl))
+                elif d > hardest_top[0][0]:
+                    heapq.heapreplace(hardest_top, (d, _hctr, img, lbl))
+                # bottom-5 lowest: max-heap via negation, replace largest when new d is smaller
+                if len(hardest_bot) < 5:
+                    heapq.heappush(hardest_bot, (-d, _hctr, img, lbl))
+                elif -d > hardest_bot[0][0]:
+                    heapq.heapreplace(hardest_bot, (-d, _hctr, img, lbl))
+
         loss = opt.cls * loss_cls + opt.div * loss_div + opt.beta * loss_akd
         losses.update(loss.item(), images.size(0))
         loss_akd_meter.update(loss_akd.item(), images.size(0))
@@ -368,6 +517,15 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
 
     if scaler is not None:
         scaler.step_epoch(epoch)
+
+    # Hardest samples snapshot
+    if collect_hardest and hardest_top:
+        save_hardest_samples(epoch, hardest_top, hardest_bot, opt.save_folder)
+
+    # Distance distribution snapshot
+    if collect_dist_snap and any(len(v) > 0 for v in dist_snap_accum.values()):
+        dist_snapshot_store[epoch] = {k: torch.cat(dist_snap_accum[k]).numpy()
+                                      for k in ('L1', 'L2', 'L3')}
 
     # GCN monitoring at end of epoch
     if use_gcn:
@@ -485,6 +643,9 @@ def validate_distill(val_loader, module_list, criterion, opt):
 
             # compute output
             output = model_s(images)
+            if opt.distill == 'norm':
+                n_cls = output.size(1)
+                output = F.layer_norm(output, (n_cls,), eps=1e-7) * opt.ceta
             loss = criterion(output, labels)
             losses.update(loss.item(), images.size(0))
 

@@ -127,10 +127,12 @@ def print_disagreement_stats(accum, epoch, opt, scaler=None):
     lambda_soft = getattr(opt, 'lambda_soft', 0.3)
     save_folder = getattr(opt, 'save_folder', None)
 
-    d_mean       = scaler.d_mean       if scaler is not None else None
-    d_std        = scaler.d_std        if scaler is not None else None
-    d_std_locked = scaler.d_std_locked if scaler is not None else None
-    d0_src  = 'tracked' if d_mean is not None else str(lambda_d0)
+    d_mean        = scaler.d_mean        if scaler is not None else None
+    d_std         = scaler.d_std         if scaler is not None else None
+    d_std_locked  = scaler.d_std_locked  if scaler is not None else None
+    d_mean_locked = scaler.d_mean_locked if scaler is not None else None
+    d0_locked = d_mean_locked is not None
+    d0_src  = ('tracked*' if d0_locked else 'tracked') if d_mean is not None else str(lambda_d0)
     k_locked = d_std_locked is not None
     k_src   = f'1/std{"*" if k_locked else ""}'
 
@@ -155,7 +157,7 @@ def print_disagreement_stats(accum, epoch, opt, scaler=None):
         pct_pass  = 100.0 * (gate > 0.5).float().mean().item()
         pct_high  = 100.0 * (gate > 0.9).float().mean().item()
         pct_low   = 100.0 * (gate < 0.1).float().mean().item()
-        dmean_val = d_mean[dkey] if d_mean is not None else float('nan')
+        dmean_val = (d_mean_locked[dkey] if d_mean_locked is not None else d_mean[dkey]) if d_mean is not None else float('nan')
         dstd_val  = d_std[dkey]  if d_std  is not None else float('nan')
         # k uses locked std if snapshotted, else current std
         dstd_for_k = d_std_locked[dkey] if d_std_locked is not None else dstd_val
@@ -305,3 +307,65 @@ def save_gcn_plots(snapshot_store, loss_G_history, akd_loss_history, save_folder
         fig.savefig(os.path.join(save_folder, 'gcn_losses.png'), dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f'Saved gcn_losses.png to {save_folder}')
+
+
+def save_dist_plots(snapshot_store, save_folder):
+    """Save Pearson distance distribution histograms at snapshot epochs.
+
+    For each snapshot epoch, plots the per-sample raw disagreement distribution
+    for L1 (B↔B), L2 (B↔A), L3 (A↔B) as overlaid histograms with percentile
+    annotations (5th, 50th, 95th).
+
+    Produces:
+        dist_distributions.png  – 1 row per snapshot epoch, 3 cols (L1/L2/L3)
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    epochs_present = sorted(snapshot_store.keys())
+    if not epochs_present:
+        return
+
+    n_epochs = len(epochs_present)
+    fig, axes = plt.subplots(n_epochs, 3, figsize=(14, 4 * n_epochs))
+    if n_epochs == 1:
+        axes = axes[None, :]
+
+    term_labels = {'L1': 'L1  B↔B', 'L2': 'L2  B↔A', 'L3': 'L3  A↔B'}
+    colors      = {'L1': '#4C72B0', 'L2': '#DD8452', 'L3': '#55A868'}
+
+    for row, ep in enumerate(epochs_present):
+        snap = snapshot_store[ep]
+        for col, term in enumerate(('L1', 'L2', 'L3')):
+            ax  = axes[row, col]
+            d   = snap[term]
+            p5, p50, p95 = np.percentile(d, [5, 50, 95])
+
+            ax.hist(d, bins=60, color=colors[term], alpha=0.75, edgecolor='none')
+            for pct, val, ls in [(5, p5, ':'), (50, p50, '--'), (95, p95, ':')]:
+                ax.axvline(val, color='black', linestyle=ls, linewidth=1.2,
+                           label=f'p{pct}={val:.3f}')
+
+            ax.set_title(f'Epoch {ep} — {term_labels[term]}', fontsize=9)
+            ax.set_xlabel('Pearson distance', fontsize=8)
+            ax.set_ylabel('Count', fontsize=8)
+            ax.legend(fontsize=7, loc='upper right')
+
+            # Annotation box: mean, std, % in tails
+            mean_d = d.mean()
+            std_d  = d.std()
+            pct_lo = 100.0 * (d < p5).mean()
+            pct_hi = 100.0 * (d > p95).mean()
+            ax.text(0.02, 0.97,
+                    f'μ={mean_d:.3f}  σ={std_d:.3f}\n<p5: {pct_lo:.1f}%  >p95: {pct_hi:.1f}%',
+                    transform=ax.transAxes, fontsize=7, va='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    fig.suptitle('Pearson Distance Distributions per Epoch', fontsize=12, y=1.01)
+    fig.tight_layout()
+    out_path = os.path.join(save_folder, 'dist_distributions.png')
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved dist_distributions.png to {save_folder}')

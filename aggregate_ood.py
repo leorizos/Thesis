@@ -91,16 +91,24 @@ def main():
     all_auroc = {d: [] for d in DATASETS}
     all_fpr   = {d: [] for d in DATASETS}
     all_top1, all_top5 = [], []
+    per_seed_auroc_avg = []
+    per_seed_fpr_avg   = []
 
     for match in matches:
         result_file = None
         json_file   = None
 
         if os.path.isdir(match):
-            candidate = os.path.join(match, 'ood_results', 'all_ood_results.txt')
-            if os.path.exists(candidate):
-                result_file = candidate
-            json_candidate = os.path.join(match, 'test_best_metrics.json')
+            # Support both: pattern points to model dir, or directly to ood_results dir
+            for candidate in [
+                os.path.join(match, 'all_ood_results.txt'),
+                os.path.join(match, 'ood_results', 'all_ood_results.txt'),
+            ]:
+                if os.path.exists(candidate):
+                    result_file = candidate
+                    break
+            model_dir = os.path.dirname(match) if os.path.basename(match) == 'ood_results' else match
+            json_candidate = os.path.join(model_dir, 'test_best_metrics.json')
             if os.path.exists(json_candidate):
                 json_file = json_candidate
         elif os.path.isfile(match):
@@ -130,6 +138,14 @@ def main():
         if best_acc is not None:
             all_top1.append(best_acc)
 
+        # Per-seed average across datasets (for the Average column)
+        seed_auroc_vals = [auroc[d] for d in DATASETS if d in auroc]
+        seed_fpr_vals   = [fpr95[d] for d in DATASETS if d in fpr95]
+        if seed_auroc_vals:
+            per_seed_auroc_avg.append(sum(seed_auroc_vals) / len(seed_auroc_vals))
+        if seed_fpr_vals:
+            per_seed_fpr_avg.append(sum(seed_fpr_vals) / len(seed_fpr_vals))
+
     n = len(all_top1)
     print(f"Aggregating {n} trial(s)\n")
 
@@ -145,9 +161,9 @@ def main():
         auroc_cells.append(fmt(am, as_))
         fpr_cells.append(fmt(fm, fs))
 
-    # Average column (mean and std across the 7 dataset means)
-    avg_am, avg_as = mean_std([x for x in auroc_means if x is not None])
-    avg_fm, avg_fs = mean_std([x for x in fpr_means  if x is not None])
+    # Average column: mean and std of per-seed averages across datasets
+    avg_am, avg_as = mean_std(per_seed_auroc_avg)
+    avg_fm, avg_fs = mean_std(per_seed_fpr_avg)
 
     # Accuracy
     top1_m, top1_s = mean_std(all_top1)

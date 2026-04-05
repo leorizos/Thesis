@@ -15,7 +15,7 @@ if "%MODEL_PATH%"=="" (
 
 set MODEL_S=resnet8x4
 set BATCH_SIZE=128
-set NUM_WORKERS=0
+set NUM_WORKERS=2
 
 REM Extract model directory and create output file path
 for %%F in ("%MODEL_PATH%") do set MODEL_DIR=%%~dpF

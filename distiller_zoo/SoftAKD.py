@@ -16,16 +16,27 @@ class DisagreementScaler:
     lock_std_only=True: only d_std is locked at lock_epoch (for k computation).
       d_mean continues to update. d_std keeps tracking for display but k uses
       the snapshotted d_std_locked value from lock_epoch onward.
+
+    dynamic_lock=True: instead of a fixed lock_epoch, freezes both k (d_std) and
+      d_mean when the epoch-over-epoch delta_d_std falls below lock_std_delta for
+      all three terms. Call freeze(epoch) from the training loop when this condition
+      is met. lock_epoch still acts as a hard-deadline fallback.
     """
     def __init__(self, init=0.1, momentum=0.99, lock_epoch=240,
-                 per_batch=False, batch_momentum=0.999, lock_std_only=False):
+                 per_batch=False, batch_momentum=0.999, lock_std_only=False,
+                 dynamic_lock=False, lock_std_delta=1e-4, save_folder=None):
         self.d_max          = {'L1': init, 'L2': init, 'L3': init}
         self.d_mean         = {'L1': init, 'L2': init, 'L3': init}
         self.d_std          = {'L1': init, 'L2': init, 'L3': init}
-        self.d_std_locked   = None   # set at lock_epoch when lock_std_only=True
+        self.d_std_locked   = None   # set at lock_epoch when lock_std_only=True, or by freeze()
+        self.d_mean_locked  = None   # set by freeze() — both k and d0 are frozen together
         self.momentum       = momentum
         self.lock_epoch     = lock_epoch
         self.lock_std_only  = lock_std_only
+        self.dynamic_lock   = dynamic_lock
+        self.lock_std_delta = lock_std_delta
+        self.save_folder    = save_folder
+        self._locked        = False   # True after freeze() is called
         self.per_batch      = per_batch
         self.batch_momentum = batch_momentum
         self._current_epoch = 0
@@ -33,6 +44,26 @@ class DisagreementScaler:
         self._epoch_sum     = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
         self._epoch_n       = {'L1': 0,    'L2': 0,    'L3': 0}
         self._epoch_sq      = {'L1': 0.0,  'L2': 0.0,  'L3': 0.0}
+
+    def freeze(self, epoch):
+        """Snapshot d_std and d_mean and freeze all further EMA updates.
+
+        Called from the training loop when dynamic_lock=True and the
+        epoch-over-epoch delta_d_std drops below lock_std_delta for all terms.
+        """
+        if self._locked:
+            return
+        self.d_std_locked  = {k: v for k, v in self.d_std.items()}
+        self.d_mean_locked = {k: v for k, v in self.d_mean.items()}
+        self._locked = True
+        std_str  = ', '.join(f'{k}={self.d_std_locked[k]:.6f}'  for k in ('L1', 'L2', 'L3'))
+        mean_str = ', '.join(f'{k}={self.d_mean_locked[k]:.6f}' for k in ('L1', 'L2', 'L3'))
+        msg = (f'[SoftAKD] d_std converged at epoch {epoch}, freezing k and d_mean.\n'
+               f'  std={{{std_str}}}\n'
+               f'  mean={{{mean_str}}}')
+        print(msg)
+        from distiller_zoo.SoftAKD2 import _log_to_file
+        _log_to_file(msg, self.save_folder)
 
     def update(self, d_L1, d_L2, d_L3):
         """Call once per batch. Updates stats either per-batch or accumulates for epoch."""
@@ -44,7 +75,7 @@ class DisagreementScaler:
             self._epoch_n[key]   += d.numel()
             self._epoch_sq[key]  += (d ** 2).sum().item()
 
-            if self.per_batch:
+            if self.per_batch and not self._locked:
                 update_mean = self._current_epoch <= self.lock_epoch or self.lock_std_only
                 update_std  = self._current_epoch <= self.lock_epoch or self.lock_std_only
                 if update_mean or update_std or self._current_epoch <= self.lock_epoch:
@@ -72,7 +103,7 @@ class DisagreementScaler:
                     self.d_max[key]  = self._epoch_max[key]
                     self.d_mean[key] = self._epoch_sum[key] / self._epoch_n[key]
                     self.d_std[key]  = (self._epoch_sq[key] / self._epoch_n[key] - self.d_mean[key] ** 2) ** 0.5
-            else:
+            elif not self._locked:
                 m = 0.9 if epoch <= 20 else self.momentum
                 for key in self.d_max:
                     epoch_mean = self._epoch_sum[key] / self._epoch_n[key]
@@ -86,8 +117,8 @@ class DisagreementScaler:
                     # d_std: update always for tracking (k uses d_std_locked after lock)
                     if self.lock_std_only or epoch <= self.lock_epoch:
                         self.d_std[key]  = m * self.d_std[key]  + (1 - m) * epoch_std
-            # Snapshot d_std at lock_epoch for k computation
-            if self.lock_std_only and epoch == self.lock_epoch and self.d_std_locked is None:
+            # Snapshot d_std at lock_epoch for k computation (lock_std_only hard deadline)
+            if self.lock_std_only and epoch == self.lock_epoch and self.d_std_locked is None and not self._locked:
                 self.d_std_locked = {k: v for k, v in self.d_std.items()}
         self._epoch_max = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
         self._epoch_sum = {'L1': 0.0, 'L2': 0.0, 'L3': 0.0}
@@ -294,10 +325,25 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     d_L2 = pearson_distance_rows(a_teacher_sim, a_student_sim)      # [B]
     d_L3 = pearson_distance_rows(a_teacher_sim_t, a_student_sim_t)  # [A]
 
-    if scaler is not None:
-        scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
+    cell_wise = getattr(opt, 'cell_wise', False)
 
-    d0s = {k: scaler.d_mean[k] for k in ('L1', 'L2', 'L3')} if scaler is not None else {}
+    if cell_wise:
+        # Outer products: cell [i,j] = d_i * d_j using the appropriate row/col distances
+        cell_L1 = d_L1.detach()[:, None] * d_L1.detach()[None, :]  # [B, B]
+        cell_L2 = d_L2.detach()[:, None] * d_L3.detach()[None, :]  # [B, A]
+        cell_L3 = d_L3.detach()[:, None] * d_L2.detach()[None, :]  # [A, B]
+
+    if scaler is not None:
+        if cell_wise:
+            scaler.update(cell_L1.reshape(-1), cell_L2.reshape(-1), cell_L3.reshape(-1))
+        else:
+            scaler.update(d_L1.detach(), d_L2.detach(), d_L3.detach())
+
+    if scaler is not None:
+        d_mean_src = scaler.d_mean_locked if scaler.d_mean_locked is not None else scaler.d_mean
+        d0s = {k: d_mean_src[k] for k in ('L1', 'L2', 'L3')}
+    else:
+        d0s = {}
     if scaler is not None:
         d_std_for_k = scaler.d_std_locked if scaler.d_std_locked is not None else scaler.d_std
         k0s = {k: 1.0 / (d_std_for_k[k] + 1e-7) for k in ('L1', 'L2', 'L3')}
@@ -305,19 +351,33 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         k0s = {}
 
     stats = None
-    if return_stats:
-        lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
-        lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
-        lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
-        stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
-                 'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
-        lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
-        lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
-        lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
+    if cell_wise:
+        if return_stats:
+            lam_L1, _, gate_L1 = adaptive_lambda(cell_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
+            lam_L2, _, gate_L2 = adaptive_lambda(cell_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
+            lam_L3, _, gate_L3 = adaptive_lambda(cell_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
+            # Stats: keep row-wise raw distances for monitoring; average gate across columns
+            stats = {'raw_L1': d_L1.detach(), 'raw_L2': d_L2.detach(), 'raw_L3': d_L3.detach(),
+                     'gate_L1': gate_L1.mean(dim=1), 'gate_L2': gate_L2.mean(dim=1), 'gate_L3': gate_L3.mean(dim=1)}
+        else:
+            lam_L1 = adaptive_lambda(cell_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'))
+            lam_L2 = adaptive_lambda(cell_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'))
+            lam_L3 = adaptive_lambda(cell_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'))
+        # lam_L1: [B,B], lam_L2: [B,A], lam_L3: [A,B] — no unsqueeze, blending is element-wise
     else:
-        lam_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
-        lam_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
-        lam_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
+        if return_stats:
+            lam_L1, raw_L1, gate_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1'), return_stats=True)
+            lam_L2, raw_L2, gate_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2'), return_stats=True)
+            lam_L3, raw_L3, gate_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3'), return_stats=True)
+            stats = {'raw_L1': raw_L1, 'raw_L2': raw_L2, 'raw_L3': raw_L3,
+                     'gate_L1': gate_L1, 'gate_L2': gate_L2, 'gate_L3': gate_L3}
+            lam_L1 = lam_L1.unsqueeze(1)  # [B, 1]
+            lam_L2 = lam_L2.unsqueeze(1)  # [B, 1]
+            lam_L3 = lam_L3.unsqueeze(1)  # [A, 1]
+        else:
+            lam_L1 = adaptive_lambda(d_L1, lambda_soft, d0_override=d0s.get('L1'), k_override=k0s.get('L1')).unsqueeze(1)  # [B, 1]
+            lam_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
+            lam_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
 
     b_teacher_sim   = (1 - lam_L1) * b_teacher_sim   + lam_L1 * sigma_bb
     a_teacher_sim   = (1 - lam_L2) * a_teacher_sim   + lam_L2 * sigma_ba

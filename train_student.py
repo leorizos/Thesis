@@ -5,7 +5,8 @@ the general training framework
 from __future__ import print_function
 
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow INFO and WARNING messages
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'       # Suppress TensorFlow INFO and WARNING messages
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # Required for cuBLAS determinism
 
 import re
 import argparse
@@ -31,7 +32,7 @@ from helper.loops import train_distill as train, train_distill_akd, validate_van
 from helper.util import save_dict_to_json, reduce_tensor, adjust_learning_rate
 
 from crd.criterion import CRDLoss
-from distiller_zoo import DistillKL, HintLoss, Attention, Similarity, VIDLoss, SemCKDLoss, PKT, SoftPKT2, AnchorNet, calculate_anchor_set, GCN
+from distiller_zoo import DistillKL, HintLoss, Attention, Similarity, VIDLoss, SemCKDLoss, PKT, AnchorNet, calculate_anchor_set, GCN, RKDLoss, NORMConnector, TTM, WTTM
 
 split_symbol = '~' if os.name == 'nt' else ':'
 
@@ -63,8 +64,11 @@ def parse_option():
     # distillation
     parser.add_argument('--trial', type=str, default='1', help='trial id')
     parser.add_argument('--kd_T', type=float, default=4, help='temperature for KD distillation')
+    parser.add_argument('--ttm_l', type=float, default=1.0,
+                        help='TTM/WTTM: exponent applied to teacher softmax (default 1.0)')
     parser.add_argument('--distill', type=str, default='kd', choices=['kd', 'hint', 'attention', 'similarity', 'vid',
-                                                                      'crd', 'semckd','srrl','pkt', 'soft_pkt2', 'akd', 'soft_akd'])
+                                                                      'crd', 'semckd','srrl','pkt', 'akd', 'soft_akd', 'rkd', 'norm',
+                                                                      'ttm', 'wttm'])
     parser.add_argument('-c', '--cls', type=float, default=1.0, help='weight for classification')
     parser.add_argument('-d', '--div', type=float, default=1.0, help='weight balance for KD')
     parser.add_argument('-b', '--beta', type=float, default=0.0, help='weight balance for other losses')
@@ -96,8 +100,18 @@ def parse_option():
                         help='Soft AKD disagreement scaler EMA update frequency: epoch (default) or batch')
     parser.add_argument('--batch_momentum', type=float, default=0.999,
                         help='Soft AKD per-batch EMA momentum (default 0.999, used when scaler_update_freq=batch)')
+    # NORM
+    parser.add_argument('--co_sponge', type=int, default=4,
+                        help='NORM: channel expansion factor for feature distillation (default 4)')
+
+    parser.add_argument('--cell_wise', action='store_true',
+                        help='Soft AKD: cell-wise lambda via outer product d_i*d_j instead of row-wise d_i')
     parser.add_argument('--lock_std_only', action='store_true',
                         help='Soft AKD: freeze only d_std (k=scale/std) at lock_epoch; d_mean continues updating')
+    parser.add_argument('--dynamic_lock', action='store_true',
+                        help='Soft AKD: dynamically freeze k and d_mean when epoch-over-epoch delta_d_std < lock_std_delta for all terms')
+    parser.add_argument('--lock_std_delta', type=float, default=1e-4,
+                        help='Soft AKD: delta_d_std threshold for dynamic_lock (default 1e-4)')
     parser.add_argument('--tag', type=str, default='',
                         help='Optional tag appended to model name for run identification')
 
@@ -147,6 +161,8 @@ def parse_option():
     opt.model_name = model_name_template.format(opt.model_s, opt.model_t, opt.dataset, opt.distill,
                                                 opt.cls, opt.div, opt.beta, opt.trial)
     if opt.distill == 'soft_akd':
+        if getattr(opt, 'cell_wise', False):
+            opt.lambda_mode = 'cw'
         lm = getattr(opt, 'lambda_mode', 'rw')
         if getattr(opt, 'no_gcn', False):
             opt.model_name += '_l_{}_{}_nogcn'.format(opt.lambda_soft, lm)
@@ -166,6 +182,8 @@ def parse_option():
             opt.model_name += '_upb'
         if opt.lock_std_only:
             opt.model_name += '_lkstd'
+        if opt.dynamic_lock:
+            opt.model_name += '_dynlk'
     if opt.tag:
         opt.model_name += '_{}'.format(opt.tag)
     opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
@@ -288,6 +306,7 @@ def main_worker(gpu, ngpus_per_node, opt):
         cudnn.benchmark = False
         numpy.random.seed(int(opt.trial))
         random.seed(int(opt.trial))
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     # model
     n_cls = {
@@ -366,8 +385,19 @@ def main_worker(gpu, ngpus_per_node, opt):
     elif opt.distill == 'pkt':
         from distiller_zoo import PKT
         criterion_kd = PKT()
-    elif opt.distill == 'soft_pkt2':
-        criterion_kd = SoftPKT2(sigma_path=opt.sigma_path, lambda_soft=opt.lambda_soft)
+    elif opt.distill == 'rkd':
+        criterion_kd = RKDLoss()
+    elif opt.distill == 'ttm':
+        criterion_kd = TTM(opt.ttm_l)
+    elif opt.distill == 'wttm':
+        criterion_kd = WTTM(opt.ttm_l)
+    elif opt.distill == 'norm':
+        s_ch = feat_s[-2].shape[1]
+        t_ch = feat_t[-2].shape[1]
+        norm_connector = NORMConnector(s_ch, t_ch, co_sponge=opt.co_sponge)
+        module_list.append(norm_connector)
+        trainable_list.append(norm_connector)
+        criterion_kd = nn.MSELoss()   # placeholder; loss computed in loop
     elif opt.distill in ['akd', 'soft_akd']:
         # AKD/SoftAKD loss is computed directly in the training loop
         criterion_kd = nn.MSELoss()
@@ -541,19 +571,24 @@ def main_worker(gpu, ngpus_per_node, opt):
                 print(f'    Soft AKD: GCN disabled (--no_gcn), using raw sigma only')
 
     # GCN diagnostic collectors (only used when distill == 'soft_akd' with GCN)
-    gcn_snapshot_store = {} if (opt.distill == 'soft_akd' and gcn is not None) else None
+    gcn_snapshot_store  = {} if (opt.distill == 'soft_akd' and gcn is not None) else None
+    dist_snapshot_store = {} if opt.distill == 'soft_akd' else None
 
     # Disagreement scaler: persists across epochs to track running max/mean per term
     dis_scaler = None
-    if opt.distill == 'soft_akd' and getattr(opt, 'lambda_mode', 'rw') == 'rw':
+    if opt.distill == 'soft_akd' and getattr(opt, 'lambda_mode', 'rw') in ('rw', 'cw'):
         from distiller_zoo.SoftAKD import DisagreementScaler
         dis_scaler = DisagreementScaler(
             per_batch=opt.scaler_update_freq == 'batch',
             batch_momentum=opt.batch_momentum,
             lock_std_only=opt.lock_std_only,
+            dynamic_lock=opt.dynamic_lock,
+            lock_std_delta=opt.lock_std_delta,
+            save_folder=opt.save_folder,
         )
     gcn_loss_G_history = []
     gcn_loss_akd_history = []
+    prev_dis_stats = {}   # tracks last epoch's d_std and dis_raw for delta logging
 
     # routine
     for epoch in range(start_epoch + 1, opt.epochs + 1):
@@ -578,7 +613,8 @@ def main_worker(gpu, ngpus_per_node, opt):
                 sigma=sigma, anchor_labels=anchor_labels,
                 gcn=gcn, optimizer_gcn=optimizer_gcn,
                 snapshot_store=gcn_snapshot_store,
-                scaler=dis_scaler
+                scaler=dis_scaler,
+                dist_snapshot_store=dist_snapshot_store
             )
             if gcn is not None:
                 gcn_loss_G_history.append(epoch_loss_G)
@@ -603,6 +639,23 @@ def main_worker(gpu, ngpus_per_node, opt):
             if dis_tb_stats is not None:
                 for key, val in dis_tb_stats.items():
                     logger.log_value(key, val, epoch)
+                # Log epoch-over-epoch deltas for d_std and avg raw disagreement
+                std_deltas = {}
+                for term in ('L1', 'L2', 'L3'):
+                    for stat in (f'd_std_{term}', f'dis_raw_{term}'):
+                        if stat in dis_tb_stats and stat in prev_dis_stats:
+                            delta_val = dis_tb_stats[stat] - prev_dis_stats[stat]
+                            logger.log_value(f'delta_{stat}', delta_val, epoch)
+                            if stat.startswith('d_std_'):
+                                std_deltas[term] = delta_val
+                prev_dis_stats = {k: v for k, v in dis_tb_stats.items()
+                                  if k.startswith('d_std_') or k.startswith('dis_raw_')}
+                # Dynamic freeze: trigger when all three delta_d_std fall below threshold
+                if (dis_scaler is not None and dis_scaler.dynamic_lock
+                        and not dis_scaler._locked
+                        and len(std_deltas) == 3
+                        and all(abs(std_deltas[t]) < dis_scaler.lock_std_delta for t in ('L1', 'L2', 'L3'))):
+                    dis_scaler.freeze(epoch)
 
         # Validate every 2 epochs or on the last epoch
         if epoch % 2 == 0 or epoch == opt.epochs:
@@ -663,6 +716,11 @@ def main_worker(gpu, ngpus_per_node, opt):
             from distiller_zoo.SoftAKD2 import save_gcn_plots
             save_gcn_plots(gcn_snapshot_store, gcn_loss_G_history, gcn_loss_akd_history,
                            opt.save_folder, opt.alpha_soft)
+
+        # Save distance distribution plots
+        if dist_snapshot_store:
+            from distiller_zoo.SoftAKD2 import save_dist_plots
+            save_dist_plots(dist_snapshot_store, opt.save_folder)
         
         # save parameters
         save_state = {k: v for k, v in opt._get_kwargs()}

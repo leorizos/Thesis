@@ -10,6 +10,7 @@ from .resnet_imagenet import resnet18, resnet34, resnet50, wide_resnet50_2, resn
 from .resnet_imagenet import wide_resnet10_2, wide_resnet18_2, wide_resnet34_2
 from .mobilenetv2_imagenet import mobilenet_v2
 from .shuffleNetv2_imagenet import shufflenet_v2_x1_0
+from .vit_cifar import vit_small_cifar, vit_base_cifar
 
 model_dict = {
     'resnet8': resnet8,
@@ -47,4 +48,7 @@ model_dict = {
     
     'MobileNetV2_Imagenet': mobilenet_v2,
     'ShuffleV2_Imagenet': shufflenet_v2_x1_0,
+
+    'vit_small_cifar': vit_small_cifar,
+    'vit_base_cifar':  vit_base_cifar,
 }
