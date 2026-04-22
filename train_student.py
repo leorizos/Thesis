@@ -79,7 +79,7 @@ def parse_option():
 
     # soft PKT v2
     parser.add_argument('--lambda_soft', type=float, default=0.3, help='Soft AKD: max sigma weight (0.0 = pure teacher, 1.0 = pure sigma)')
-    parser.add_argument('--sigma_temp', type=float, default=None, help='static temperature for sharpening sigma (< 1.0 sharpens); if omitted, typicality-driven dynamic α is used instead')
+    parser.add_argument('--sigma_temp', type=float, default=1.0, help='temperature for sharpening sigma (< 1.0 sharpens)')
     parser.add_argument('--sigma_path', type=str, default='save/class_similarity_matrix.npy',
                         help='path to class similarity matrix for soft PKT v2')
     parser.add_argument('--sigma_mode', type=str, default='precomputed', choices=['precomputed', 'student'],
@@ -175,7 +175,7 @@ def parse_option():
             opt.model_name += '_d0ma'
         if opt.sigma_mode == 'student':
             opt.model_name += '_sigstu'
-        if opt.sigma_temp is not None and opt.sigma_mode != 'student':
+        if opt.sigma_temp != 1.0 and opt.sigma_mode != 'student':
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
         if opt.sigma_s_mode != 'ab':
             opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
@@ -526,7 +526,7 @@ def main_worker(gpu, ngpus_per_node, opt):
 
     # ==================== AKD / Soft AKD setup ====================
     anchor_set = anchor_net = optimizer_anchor = a_feat_t = None
-    sigma = anchor_labels = typ_t_precomputed = None
+    sigma = anchor_labels = None
     gcn = optimizer_gcn = None
     if opt.distill in ['akd', 'soft_akd']:
         img_dim = 32 if opt.dataset in ('cifar100', 'cifar100_oscr') else 224
@@ -587,18 +587,7 @@ def main_worker(gpu, ngpus_per_node, opt):
                     f"Sigma shape {tuple(sigma.shape)} does not match num_classes={n_cls}."
                 )
                 print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
-                if opt.sigma_temp is None:
-                    # Precompute teacher typicality for per-class dynamic α
-                    from distiller_zoo.SoftAKD import compute_row_typicality
-                    import torch.nn.functional as _F
-                    with torch.no_grad():
-                        _a_norm = _F.normalize(a_feat_t, p=2, dim=1)
-                        _a_sim  = (torch.mm(_a_norm, _a_norm.t()) + 1) / 2  # [C, C]
-                        typ_t_precomputed = compute_row_typicality(_a_sim, sigma)
-                    n_nan = torch.isnan(typ_t_precomputed).sum().item()
-                    print(f'    Soft AKD: teacher typicality precomputed ({n_nan} nan classes), dynamic α active')
-                else:
-                    print(f'    Soft AKD: sigma_temp={opt.sigma_temp} — typicality/α disabled, using static exponent')
+                print(f'    Soft AKD: sigma_temp = {opt.sigma_temp}')
             if opt.sigma_mode != 'student' and not getattr(opt, 'no_gcn', False):
                 gcn = GCN(num_classes=n_cls).cuda(gpu_device)
                 optimizer_gcn = torch.optim.Adam(gcn.parameters(), lr=opt.gcn_lr)
@@ -623,11 +612,6 @@ def main_worker(gpu, ngpus_per_node, opt):
             lock_std_delta=opt.lock_std_delta,
             save_folder=opt.save_folder,
         )
-    typ_logger = None
-    if opt.distill == 'soft_akd' and opt.sigma_temp is None:
-        from distiller_zoo.SoftAKD import TypicalityLogger
-        typ_logger = TypicalityLogger(opt.save_folder)
-
     gcn_loss_G_history = []
     gcn_loss_akd_history = []
     prev_dis_stats = {}   # tracks last epoch's d_std and dis_raw for delta logging
@@ -657,8 +641,6 @@ def main_worker(gpu, ngpus_per_node, opt):
                 snapshot_store=gcn_snapshot_store,
                 scaler=dis_scaler,
                 dist_snapshot_store=dist_snapshot_store,
-                typicality_logger=typ_logger,
-                typ_t_precomputed=typ_t_precomputed,
             )
             if gcn is not None:
                 gcn_loss_G_history.append(epoch_loss_G)

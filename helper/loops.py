@@ -300,9 +300,7 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                       criterion_list, optimizer, optimizer_anchor, opt, a_feat_t,
                       sigma=None, anchor_labels=None,
                       gcn=None, optimizer_gcn=None, snapshot_store=None,
-                      scaler=None, dist_snapshot_store=None,
-                      typicality_logger=None,
-                      typ_t_precomputed=None):
+                      scaler=None, dist_snapshot_store=None):
     """One epoch of Anchor-based Knowledge Distillation (AKD / Soft AKD).
 
     AKD introduces learnable anchor images whose spatial attention is optimised
@@ -433,20 +431,14 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_soft,
                                      opt.lambda_soft, opt, return_stats=collect_tb,
-                                     scaler=scaler,
-                                     typicality_logger=typicality_logger,
-                                     batch_idx=idx, epoch=epoch,
-                                     typ_t_precomputed=typ_t_precomputed)
+                                     scaler=scaler)
         elif use_soft:
             sigma_in = None if is_student_mode else sigma
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_in,
                                      opt.lambda_soft, opt, return_stats=collect_tb,
-                                     scaler=scaler,
-                                     typicality_logger=typicality_logger,
-                                     batch_idx=idx, epoch=epoch,
-                                     typ_t_precomputed=typ_t_precomputed)
+                                     scaler=scaler)
         else:
             loss_akd = akd_loss(feat_teacher.detach(), feat_student,
                                 a_feat_t.detach(), a_feat_s, opt)
@@ -550,10 +542,6 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     if collect_dis and any(len(v) > 0 for v in dis_accum.values()):
         from distiller_zoo.SoftAKD2 import print_disagreement_stats
         print_disagreement_stats(dis_accum, epoch, opt, scaler=scaler)
-
-    # Typicality epoch summary
-    if typicality_logger is not None:
-        typicality_logger.end_epoch(epoch)
 
     # Build tensorboard stats dict (every epoch)
     dis_tb_stats = None
