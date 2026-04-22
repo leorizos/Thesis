@@ -1,5 +1,9 @@
 from __future__ import print_function, division
 
+import csv
+import math
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -127,6 +131,7 @@ class DisagreementScaler:
 
 
 
+
 class GCN(nn.Module):
     """Learnable confusion matrix for adaptive sigma softening."""
     def __init__(self, num_classes):
@@ -159,7 +164,8 @@ def soften_sigma_with_gcn(sigma, target_net, output_net, anchor_target, anchor_n
     C = num_classes
 
     output_net = F.normalize(output_net, p=2, dim=1)   # [B, D]
-    anchor_net = F.normalize(anchor_net, p=2, dim=1)   # [A, D]
+    if anchor_net is not None:
+        anchor_net = F.normalize(anchor_net, p=2, dim=1)   # [A, D]
 
     if sigma_s_mode == 'ab':
         # Merged batch+anchor features [B+A, D], 100% class coverage
@@ -209,6 +215,8 @@ def soften_sigma_with_gcn(sigma, target_net, output_net, anchor_target, anchor_n
 
     return Sigma_t_hat.detach(), loss_G
 
+
+
 def pearson_distance_rows(P, Q, eps=1e-7):
     """
     Pearson distance between corresponding rows of P and Q.
@@ -247,8 +255,6 @@ def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_s
     raw_dis = disagreement.detach()
     if d0_override is not None:
         midpoint = d0_override
-    elif d0 == 'ma':
-        midpoint = disagreement.mean()
     else:
         disagreement = disagreement / (disagreement.max() + eps)
         midpoint = d0
@@ -260,9 +266,309 @@ def adaptive_lambda(disagreement, lambda_max, k=10.0, d0=0.3, eps=1e-7, return_s
 
 
 
+# ---------------------------------------------------------------------------
+# Typicality helpers (pure Python / small torch; no grad needed)
+# ---------------------------------------------------------------------------
+
+def _mean(lst):
+    return sum(lst) / len(lst) if lst else float('nan')
+
+def _std(lst):
+    if len(lst) < 2:
+        return float('nan')
+    m = _mean(lst)
+    return math.sqrt(sum((x - m) ** 2 for x in lst) / len(lst))
+
+def _pearson_lists(xs, ys):
+    n = min(len(xs), len(ys))
+    if n < 2:
+        return float('nan')
+    xs, ys = list(xs)[:n], list(ys)[:n]
+    mx, my = _mean(xs), _mean(ys)
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    sy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    if sx < 1e-7 or sy < 1e-7:
+        return float('nan')
+    return cov / (sx * sy)
+
+def _fmt(v):
+    try:
+        return f'{float(v):.6f}' if not math.isnan(float(v)) else 'nan'
+    except (TypeError, ValueError):
+        return 'nan'
+
+
+def compute_typicality(sim_matrix, sigma_full, labels, eps=1e-7):
+    """Measure how well the batch's class-level similarity structure matches sigma.
+
+    Aggregates the B×B raw similarity matrix into a C_b×C_b class-level matrix
+    (where C_b = unique classes in batch), then correlates with the corresponding
+    C_b×C_b submatrix of sigma_full via Pearson correlation.
+
+    Args:
+        sim_matrix: [B, B] raw cosine similarity (teacher or student), values in [0,1]
+        sigma_full: [C_full, C_full] precomputed class similarity matrix
+        labels:     [B] integer class labels (indices into sigma_full rows/cols)
+    Returns:
+        typ_global:         scalar Pearson r on upper triangle (excl. diagonal)
+        typ_row_values:     list[float] per-class Pearson r (nan if < 3 off-diag elements)
+        num_unique_classes: int
+    """
+    device = sim_matrix.device
+    B = sim_matrix.size(0)
+
+    unique_classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
+    C_b = len(unique_classes)
+
+    counts = torch.zeros(C_b, device=device)
+    counts.scatter_add_(0, inverse, torch.ones(B, device=device))
+
+    # Row-aggregate B×B → C_b×B
+    row_agg = torch.zeros(C_b, B, device=device)
+    row_agg.scatter_add_(0, inverse.unsqueeze(1).expand(-1, B), sim_matrix)
+    row_agg = row_agg / counts.unsqueeze(1).clamp(min=1)
+
+    # Col-aggregate C_b×B → C_b×C_b
+    class_sim = torch.zeros(C_b, C_b, device=device)
+    class_sim.scatter_add_(1, inverse.unsqueeze(0).expand(C_b, -1), row_agg)
+    class_sim = class_sim / counts.unsqueeze(0).clamp(min=1)
+
+    sigma_sub = sigma_full[unique_classes][:, unique_classes]  # [C_b, C_b]
+
+    # Global: Pearson on upper triangle (excl. diagonal)
+    triu_mask = torch.triu(torch.ones(C_b, C_b, dtype=torch.bool, device=device), diagonal=1)
+    x = class_sim[triu_mask]
+    y = sigma_sub[triu_mask]
+    if x.numel() < 2:
+        typ_global = float('nan')
+    else:
+        x_c = x - x.mean()
+        y_c = y - y.mean()
+        typ_global = ((x_c * y_c).sum() / (x_c.norm() * y_c.norm() + eps)).item()
+
+    # Row-wise: vectorized Pearson over all C_b rows simultaneously
+    if C_b >= 4:
+        off_diag   = ~torch.eye(C_b, dtype=torch.bool, device=device)  # [C_b, C_b]
+        off_diag_f = off_diag.float()
+        n_off      = float(C_b - 1)
+        x_sum  = (class_sim * off_diag_f).sum(dim=1, keepdim=True)     # [C_b, 1]
+        y_sum  = (sigma_sub * off_diag_f).sum(dim=1, keepdim=True)
+        x_c    = (class_sim - x_sum / n_off) * off_diag_f              # [C_b, C_b]
+        y_c    = (sigma_sub - y_sum / n_off) * off_diag_f
+        cov    = (x_c * y_c).sum(dim=1)                                 # [C_b]
+        sx     = (x_c ** 2).sum(dim=1).sqrt()
+        sy     = (y_c ** 2).sum(dim=1).sqrt()
+        denom  = sx * sy
+        row_r  = torch.where(denom < eps,
+                             torch.full_like(cov, float('nan')),
+                             cov / (denom + eps))
+        typ_row_values = row_r.tolist()
+    else:
+        typ_row_values = [float('nan')] * C_b
+
+    return typ_global, typ_row_values, C_b
+
+
+def compute_row_typicality(class_sim_matrix, sigma_full, eps=1e-7):
+    """Row-wise Pearson correlation between each class row and the corresponding sigma row.
+
+    Used to precompute teacher typicality once before training (from the teacher's C×C
+    anchor similarity matrix), and per-batch for student typicality.
+
+    Args:
+        class_sim_matrix: [C, C] class-level similarity matrix (class order matches sigma_full)
+        sigma_full:       [C, C] precomputed class similarity matrix
+    Returns:
+        typ_row: tensor [C] per-class Pearson r (nan for rows with < 3 off-diagonal elements)
+    """
+    C = class_sim_matrix.size(0)
+    device = class_sim_matrix.device
+    if C < 4:
+        return torch.full((C,), float('nan'), device=device)
+    # Vectorized: compute all C row-wise Pearson correlations simultaneously
+    off_diag   = ~torch.eye(C, dtype=torch.bool, device=device)   # [C, C]
+    off_diag_f = off_diag.float()
+    n_off      = float(C - 1)
+    x_sum  = (class_sim_matrix * off_diag_f).sum(dim=1, keepdim=True)
+    y_sum  = (sigma_full * off_diag_f).sum(dim=1, keepdim=True)
+    x_c    = (class_sim_matrix - x_sum / n_off) * off_diag_f
+    y_c    = (sigma_full       - y_sum / n_off) * off_diag_f
+    cov    = (x_c * y_c).sum(dim=1)
+    sx     = (x_c ** 2).sum(dim=1).sqrt()
+    sy     = (y_c ** 2).sum(dim=1).sqrt()
+    denom  = sx * sy
+    return torch.where(denom < eps,
+                       torch.full_like(cov, float('nan')),
+                       cov / (denom + eps))
+
+
+
+class TypicalityLogger:
+    """Logs per-batch and per-epoch typicality statistics to two CSV files.
+
+    Per-batch CSV (every LOG_EVERY_N_BATCHES batches):
+        epoch, batch_idx, typ_t/s globals, row mean/std/min/max,
+        num_unique_classes, mean_lambda, mean_difficulty
+
+    Per-epoch CSV (every epoch):
+        epoch, typ_t/s global mean±std, row mean-of-means, row mean-of-stds,
+        corr(typ_t, difficulty), corr(typ_s, difficulty), corr(typ_t, typ_s)
+
+    Stdout per epoch:
+        [Typicality] Epoch N: typ_t=mean±std, typ_s=mean±std, corr(t,s)=val
+    """
+
+    LOG_EVERY_N_BATCHES = 260
+
+    def __init__(self, save_folder):
+        from datetime import datetime
+        self.save_folder = save_folder
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._batch_path = os.path.join(save_folder, f'typicality_batch_{ts}.csv')
+        self._epoch_path = os.path.join(save_folder, f'typicality_epoch_{ts}.csv')
+
+        _batch_cols = [
+            'epoch', 'batch_idx',
+            'typ_t_global', 'typ_s_global',
+            'typ_t_row_mean', 'typ_t_row_std',
+            'typ_s_row_mean', 'typ_s_row_std',
+            'typ_t_row_min', 'typ_t_row_max',
+            'typ_s_row_min', 'typ_s_row_max',
+            'num_unique_classes', 'mean_lambda', 'mean_difficulty',
+            'alpha_mean', 'alpha_std', 'alpha_min', 'alpha_max',
+        ]
+        _epoch_cols = [
+            'epoch',
+            'typ_t_global_mean', 'typ_t_global_std',
+            'typ_s_global_mean', 'typ_s_global_std',
+            'typ_t_row_mean_of_means', 'typ_t_row_mean_of_stds',
+            'typ_s_row_mean_of_means', 'typ_s_row_mean_of_stds',
+            'corr_typ_t_difficulty', 'corr_typ_s_difficulty', 'corr_typ_t_typ_s',
+            'alpha_mean', 'alpha_std', 'ema_s_mean', 'ema_s_std',
+        ]
+        with open(self._batch_path, 'w', newline='') as f:
+            csv.writer(f).writerow(_batch_cols)
+        with open(self._epoch_path, 'w', newline='') as f:
+            csv.writer(f).writerow(_epoch_cols)
+
+        self._reset_epoch()
+
+    def _reset_epoch(self):
+        self._ep_typ_t_global  = []
+        self._ep_typ_s_global  = []
+        self._ep_t_row_means   = []
+        self._ep_t_row_stds    = []
+        self._ep_s_row_means   = []
+        self._ep_s_row_stds    = []
+        self._ep_difficulty    = []
+        self._ep_alpha_means   = []
+        self._ep_alpha_stds    = []
+
+    def log_batch(self, epoch, batch_idx,
+                  typ_t_global, typ_t_row_values,
+                  typ_s_global, typ_s_row_values,
+                  num_unique_classes, mean_lambda, mean_difficulty,
+                  alpha_stats=None):
+        # Always accumulate for epoch summary
+        if not math.isnan(float(typ_t_global)):
+            self._ep_typ_t_global.append(typ_t_global)
+        if not math.isnan(float(typ_s_global)):
+            self._ep_typ_s_global.append(typ_s_global)
+        self._ep_difficulty.append(mean_difficulty)
+
+        t_valid = [v for v in typ_t_row_values if not math.isnan(float(v))]
+        s_valid = [v for v in typ_s_row_values if not math.isnan(float(v))]
+        t_row_mean = _mean(t_valid)
+        t_row_std  = _std(t_valid)
+        s_row_mean = _mean(s_valid)
+        s_row_std  = _std(s_valid)
+        if not math.isnan(float(t_row_mean)):
+            self._ep_t_row_means.append(t_row_mean)
+            self._ep_t_row_stds.append(t_row_std if not math.isnan(float(t_row_std)) else 0.0)
+        if not math.isnan(float(s_row_mean)):
+            self._ep_s_row_means.append(s_row_mean)
+            self._ep_s_row_stds.append(s_row_std if not math.isnan(float(s_row_std)) else 0.0)
+        if alpha_stats is not None:
+            self._ep_alpha_means.append(alpha_stats['mean'])
+            self._ep_alpha_stds.append(alpha_stats['std'])
+
+        if batch_idx % self.LOG_EVERY_N_BATCHES != 0:
+            return
+
+        a_mean = _fmt(alpha_stats['mean']) if alpha_stats else 'nan'
+        a_std  = _fmt(alpha_stats['std'])  if alpha_stats else 'nan'
+        a_min  = _fmt(alpha_stats['min'])  if alpha_stats else 'nan'
+        a_max  = _fmt(alpha_stats['max'])  if alpha_stats else 'nan'
+        row = [
+            epoch, batch_idx,
+            _fmt(typ_t_global), _fmt(typ_s_global),
+            _fmt(t_row_mean), _fmt(t_row_std),
+            _fmt(s_row_mean), _fmt(s_row_std),
+            _fmt(min(t_valid) if t_valid else float('nan')),
+            _fmt(max(t_valid) if t_valid else float('nan')),
+            _fmt(min(s_valid) if s_valid else float('nan')),
+            _fmt(max(s_valid) if s_valid else float('nan')),
+            num_unique_classes,
+            _fmt(mean_lambda), _fmt(mean_difficulty),
+            a_mean, a_std, a_min, a_max,
+        ]
+        with open(self._batch_path, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
+    def end_epoch(self, epoch, typ_scaler=None):
+        tg = self._ep_typ_t_global
+        sg = self._ep_typ_s_global
+        d  = self._ep_difficulty
+
+        tg_mean = _mean(tg);  tg_std = _std(tg)
+        sg_mean = _mean(sg);  sg_std = _std(sg)
+        t_rm    = _mean(self._ep_t_row_means)
+        t_rs    = _mean(self._ep_t_row_stds)
+        s_rm    = _mean(self._ep_s_row_means)
+        s_rs    = _mean(self._ep_s_row_stds)
+
+        n = min(len(tg), len(d))
+        corr_t_d = _pearson_lists(tg[:n], d[:n])
+        n = min(len(sg), len(d))
+        corr_s_d = _pearson_lists(sg[:n], d[:n])
+        n = min(len(tg), len(sg))
+        corr_t_s = _pearson_lists(tg[:n], sg[:n])
+
+        a_mean = _mean(self._ep_alpha_means)
+        a_std  = _mean(self._ep_alpha_stds)
+        ema_s_mean = float('nan')
+        ema_s_std  = float('nan')
+
+        row = [
+            epoch,
+            _fmt(tg_mean), _fmt(tg_std),
+            _fmt(sg_mean), _fmt(sg_std),
+            _fmt(t_rm), _fmt(t_rs),
+            _fmt(s_rm), _fmt(s_rs),
+            _fmt(corr_t_d), _fmt(corr_s_d), _fmt(corr_t_s),
+            _fmt(a_mean), _fmt(a_std), _fmt(ema_s_mean), _fmt(ema_s_std),
+        ]
+        with open(self._epoch_path, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
+        sg_mean_p = sg_mean if not math.isnan(float(sg_mean)) else float('nan')
+        sg_std_p  = sg_std  if not math.isnan(float(sg_std))  else 0.0
+        a_mean_p  = a_mean  if not math.isnan(float(a_mean))  else float('nan')
+        a_std_p   = a_std   if not math.isnan(float(a_std))   else 0.0
+        print(f'[Typicality] Epoch {epoch}: '
+              f'α_mean={a_mean_p:.4f}±{a_std_p:.4f}, '
+              f'typ_s={sg_mean_p:.4f}±{sg_std_p:.4f}, '
+              f'ema_s_mean={ema_s_mean:.4f}, ema_s_std={ema_s_std:.4f}')
+
+        self._reset_epoch()
+
+
 def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
                   labels, anchor_labels, sigma, lambda_soft, opt, eps=1e-7,
-                  return_stats=False, scaler=None):
+                  return_stats=False, scaler=None,
+                  typicality_logger=None, batch_idx=0, epoch=0,
+                  typ_t_precomputed=None):
     """
     Soft Anchor-based Knowledge Distillation loss.
 
@@ -299,25 +605,60 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
     b_student_sim = (torch.mm(output_net, torch.t(output_net)) + 1) / 2        # [B, B]
     b_teacher_sim = (torch.mm(target_net, torch.t(target_net)) + 1) / 2        # [B, B]
 
-    # ===== SOFTENING: Blend teacher similarities with sigma target =====
+    # Typicality snapshot — raw sims before any blending or GCN softening.
+    # Computed every LOG_STRIDE batches (not every batch) to avoid Python overhead.
+    _LOG_STRIDE = TypicalityLogger.LOG_EVERY_N_BATCHES // 10  # every ~26 batches
+    _typ_t_global = _typ_s_global = _typ_t_rows = _typ_s_rows = _typ_n_cls = None
+    if typicality_logger is not None and sigma is not None and batch_idx % _LOG_STRIDE == 0:
+        with torch.no_grad():
+            _typ_t_global, _typ_t_rows, _typ_n_cls = compute_typicality(b_teacher_sim, sigma, labels)
+            _typ_s_global, _typ_s_rows, _         = compute_typicality(b_student_sim,  sigma, labels)
+
+    # ===== Per-class dynamic power scaling α(c) = exp(z(c)) =====================
+    # Computed under no_grad from student anchor typicality + precomputed teacher typicality.
+    # σ_temp (opt.sigma_temp) is superseded by this mechanism and is no longer applied.
+    alpha_full = None
+    if typ_t_precomputed is not None and sigma is not None:
+        with torch.no_grad():
+            # Student typicality: anchor-anchor sim [A, A], A=C since anchors span all classes
+            a_anchor_sim = (torch.mm(anchor_net, anchor_net.t()) + 1) / 2     # [A, A]
+            typ_s_full   = compute_row_typicality(a_anchor_sim, sigma)         # [C]
+            typ_t_dev    = typ_t_precomputed.to(sigma.device)
+            # Replace NaNs with 0, clamp to ignore negative correlations
+            typ_t_safe   = torch.nan_to_num(typ_t_dev,  nan=0.0).clamp(min=0.0)
+            typ_s_safe   = torch.nan_to_num(typ_s_full, nan=0.0).clamp(min=0.0)
+            # Ratio: high when teacher is typical but student is not
+            alpha_full   = (typ_t_safe + eps) / (typ_s_safe + eps)            # [C]
+
+    # ===== SOFTENING: Blend teacher similarities with power-scaled sigma ==========
     if sigma is None:
         # Student mode: use student's own batch similarities as the blend target
-        sigma_bb = b_student_sim.detach()  # [B, B]
-        sigma_ba = a_student_sim.detach()  # [B, A]
+        sigma_bb = b_student_sim.detach()    # [B, B]
+        sigma_ba = a_student_sim.detach()    # [B, A]
         sigma_ab = a_student_sim_t.detach()  # [A, B]
     else:
-        # Precomputed sigma mode
         sigma_bb = sigma[labels][:, labels]              # [B, B]
         sigma_ba = sigma[labels][:, anchor_labels]       # [B, A]
         sigma_ab = sigma[anchor_labels][:, labels]       # [A, B]
 
-        # Temperature sharpening: sigma ^ (1/T), T < 1 sharpens contrast
-        sigma_temp = getattr(opt, 'sigma_temp', 1.0)
-        if sigma_temp != 1.0:
-            exponent = 1.0 / sigma_temp
-            sigma_bb = sigma_bb ** exponent
-            sigma_ba = sigma_ba ** exponent
-            sigma_ab = sigma_ab ** exponent
+        # Per-class dynamic power scaling: α(c) = exp(z(c)) from typicality.
+        # L1/L2 rows are batch samples → α indexed by batch labels.
+        # L3 rows are anchor samples  → α indexed by anchor_labels.
+        # Falls back to static sigma_temp when typ infrastructure is not provided.
+        if alpha_full is not None:
+            alpha_bb = alpha_full[labels]                                       # [B]
+            alpha_ba = alpha_full[labels]                                       # [B]
+            alpha_ab = alpha_full[anchor_labels]                                # [A]
+            sigma_bb = sigma_bb.clamp(min=1e-6) ** alpha_bb.unsqueeze(1)       # [B, B]
+            sigma_ba = sigma_ba.clamp(min=1e-6) ** alpha_ba.unsqueeze(1)       # [B, A]
+            sigma_ab = sigma_ab.clamp(min=1e-6) ** alpha_ab.unsqueeze(1)       # [A, B]
+        else:
+            sigma_temp = getattr(opt, 'sigma_temp', None)
+            if sigma_temp is not None and sigma_temp != 1.0:
+                exponent = 1.0 / sigma_temp
+                sigma_bb = sigma_bb ** exponent
+                sigma_ba = sigma_ba ** exponent
+                sigma_ab = sigma_ab ** exponent
 
     lambda_d0 = getattr(opt, 'lambda_d0', 0.3)
 
@@ -354,19 +695,40 @@ def soft_akd_loss(target_net, output_net, anchor_target, anchor_net,
         lam_L2 = adaptive_lambda(d_L2, lambda_soft, d0_override=d0s.get('L2'), k_override=k0s.get('L2')).unsqueeze(1)  # [B, 1]
         lam_L3 = adaptive_lambda(d_L3, lambda_soft, d0_override=d0s.get('L3'), k_override=k0s.get('L3')).unsqueeze(1)  # [A, 1]
 
+    # Logging
+    if typicality_logger is not None and _typ_t_global is not None:
+        alpha_stats = None
+        if alpha_full is not None:
+            with torch.no_grad():
+                alpha_stats = {
+                    'mean': alpha_full.mean().item(),
+                    'std':  alpha_full.std(unbiased=False).item(),
+                    'min':  alpha_full.min().item(),
+                    'max':  alpha_full.max().item(),
+                }
+        typicality_logger.log_batch(
+            epoch, batch_idx,
+            _typ_t_global, _typ_t_rows,
+            _typ_s_global, _typ_s_rows,
+            _typ_n_cls,
+            lam_L1.mean().item(),
+            d_L1.mean().item(),
+            alpha_stats=alpha_stats,
+        )
+
+    # Blend in similarity space, then normalize to probabilities
     b_teacher_sim   = (1 - lam_L1) * b_teacher_sim   + lam_L1 * sigma_bb
     a_teacher_sim   = (1 - lam_L2) * a_teacher_sim   + lam_L2 * sigma_ba
     a_teacher_sim_t = (1 - lam_L3) * a_teacher_sim_t + lam_L3 * sigma_ab
 
-    # Normalize to probability distributions
-    a_student_sim = a_student_sim / torch.sum(a_student_sim, dim=1, keepdim=True)
-    a_teacher_sim = a_teacher_sim / torch.sum(a_teacher_sim, dim=1, keepdim=True)
+    a_student_sim   = a_student_sim   / torch.sum(a_student_sim,   dim=1, keepdim=True)
+    a_teacher_sim   = a_teacher_sim   / torch.sum(a_teacher_sim,   dim=1, keepdim=True)
     a_teacher_sim_t = a_teacher_sim_t / torch.sum(a_teacher_sim_t, dim=1, keepdim=True)
     a_student_sim_t = a_student_sim_t / torch.sum(a_student_sim_t, dim=1, keepdim=True)
-    b_student_sim = b_student_sim / torch.sum(b_student_sim, dim=1, keepdim=True)
-    b_teacher_sim = b_teacher_sim / torch.sum(b_teacher_sim, dim=1, keepdim=True)
+    b_student_sim   = b_student_sim   / torch.sum(b_student_sim,   dim=1, keepdim=True)
+    b_teacher_sim   = b_teacher_sim   / torch.sum(b_teacher_sim,   dim=1, keepdim=True)
 
-    # KL divergence components
+    # KL divergence
     L_1 = torch.sum(b_teacher_sim * torch.log((b_teacher_sim + eps) / (b_student_sim + eps)))
     L_2 = torch.sum(a_teacher_sim * torch.log((a_teacher_sim + eps) / (a_student_sim + eps)))
     L_3 = torch.sum(a_teacher_sim_t * torch.log((a_teacher_sim_t + eps) / (a_student_sim_t + eps)))

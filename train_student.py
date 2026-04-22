@@ -57,7 +57,10 @@ def parse_option():
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 
     # dataset and model
-    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'], help='dataset')
+    parser.add_argument('--dataset', type=str, default='cifar100',
+                        choices=['cifar100', 'imagenet', 'cifar100_oscr'], help='dataset')
+    parser.add_argument('--num_classes', type=int, default=None,
+                        help='Override number of output classes (default: inferred from --dataset)')
     parser.add_argument('--model_s', type=str, default='resnet8x4')
     parser.add_argument('--path_t', type=str, default=None, help='teacher model snapshot')
 
@@ -76,7 +79,7 @@ def parse_option():
 
     # soft PKT v2
     parser.add_argument('--lambda_soft', type=float, default=0.3, help='Soft AKD: max sigma weight (0.0 = pure teacher, 1.0 = pure sigma)')
-    parser.add_argument('--sigma_temp', type=float, default=1.0, help='temperature for sharpening sigma (< 1.0 sharpens)')
+    parser.add_argument('--sigma_temp', type=float, default=None, help='static temperature for sharpening sigma (< 1.0 sharpens); if omitted, typicality-driven dynamic α is used instead')
     parser.add_argument('--sigma_path', type=str, default='save/class_similarity_matrix.npy',
                         help='path to class similarity matrix for soft PKT v2')
     parser.add_argument('--sigma_mode', type=str, default='precomputed', choices=['precomputed', 'student'],
@@ -172,7 +175,7 @@ def parse_option():
             opt.model_name += '_d0ma'
         if opt.sigma_mode == 'student':
             opt.model_name += '_sigstu'
-        if opt.sigma_temp != 1.0 and opt.sigma_mode != 'student':
+        if opt.sigma_temp is not None and opt.sigma_mode != 'student':
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
         if opt.sigma_s_mode != 'ab':
             opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
@@ -309,18 +312,19 @@ def main_worker(gpu, ngpus_per_node, opt):
         torch.use_deterministic_algorithms(True, warn_only=True)
 
     # model
-    n_cls = {
-        'cifar100': 100,
-        'imagenet': 1000,
-    }.get(opt.dataset, None)
-    
-    model_t = load_teacher(opt.path_t, n_cls, opt.gpu, opt)
+    _n_cls_defaults = {'cifar100': 100, 'imagenet': 1000, 'cifar100_oscr': 50}
+    n_cls = opt.num_classes if opt.num_classes is not None else _n_cls_defaults.get(opt.dataset)
+
+    # Teacher is always loaded with the full dataset classes (e.g. 100 for cifar100_oscr)
+    _n_cls_teacher = {'cifar100': 100, 'imagenet': 1000, 'cifar100_oscr': 100}
+    n_cls_t = _n_cls_teacher.get(opt.dataset, n_cls)
+    model_t = load_teacher(opt.path_t, n_cls_t, opt.gpu, opt)
     try:
         model_s = model_dict[opt.model_s](num_classes=n_cls)
     except KeyError:
         print("This model is not supported.")
 
-    if opt.dataset == 'cifar100':
+    if opt.dataset in ('cifar100', 'cifar100_oscr'):
         data = torch.randn(2, 3, 32, 32)
     elif opt.dataset == 'imagenet':
         data = torch.randn(2, 3, 224, 224)
@@ -471,7 +475,15 @@ def main_worker(gpu, ngpus_per_node, opt):
     # ==========================================================
 
     # dataloader
-    if opt.dataset == 'cifar100':
+    if opt.dataset == 'cifar100_oscr':
+        from dataset.cifar100_oscr import get_cifar100_oscr_dataloaders
+        if opt.distill in ['crd']:
+            train_loader, val_loader, n_data = get_cifar100_oscr_dataloaders(
+                batch_size=opt.batch_size, num_workers=opt.num_workers, is_instance=True)
+        else:
+            train_loader, val_loader = get_cifar100_oscr_dataloaders(
+                batch_size=opt.batch_size, num_workers=opt.num_workers)
+    elif opt.dataset == 'cifar100':
         if opt.distill in ['crd']:
             train_loader, val_loader, n_data = get_cifar100_dataloaders_sample(batch_size=opt.batch_size,
                                                                                num_workers=opt.num_workers,
@@ -499,8 +511,10 @@ def main_worker(gpu, ngpus_per_node, opt):
     if not opt.multiprocessing_distributed or opt.rank % ngpus_per_node == 0:
         logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
 
-    if not opt.skip_validation:
+    if not opt.skip_validation and opt.dataset != 'cifar100_oscr':
         # validate teacher accuracy
+        # skipped for cifar100_oscr: val_loader has remapped 0..49 labels but
+        # teacher outputs 100 logits, so the accuracy would be meaningless.
         teacher_acc, _, _ = validate_vanilla(val_loader, model_t, criterion_cls, opt)
 
         
@@ -512,10 +526,10 @@ def main_worker(gpu, ngpus_per_node, opt):
 
     # ==================== AKD / Soft AKD setup ====================
     anchor_set = anchor_net = optimizer_anchor = a_feat_t = None
-    sigma = anchor_labels = None
+    sigma = anchor_labels = typ_t_precomputed = None
     gcn = optimizer_gcn = None
     if opt.distill in ['akd', 'soft_akd']:
-        img_dim = 32 if opt.dataset == 'cifar100' else 224
+        img_dim = 32 if opt.dataset in ('cifar100', 'cifar100_oscr') else 224
         print('==> Computing anchor set for AKD ...')
         anchor_set = calculate_anchor_set(
             model_t, train_loader,
@@ -552,16 +566,39 @@ def main_worker(gpu, ngpus_per_node, opt):
                 print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
             else:
                 import numpy as np
-                if not os.path.exists(opt.sigma_path):
-                    raise FileNotFoundError(
-                        f"Class similarity matrix not found at {opt.sigma_path}. "
-                        f"Please run compute_class_similarity_matrix.py first."
+                if opt.dataset == 'cifar100_oscr':
+                    from dataset.cifar100_oscr import compute_sigma_from_teacher
+                    sigma = compute_sigma_from_teacher(
+                        model_t, train_loader, n_cls, f'cuda:{gpu_device}'
                     )
-                sigma_np = np.load(opt.sigma_path)
-                sigma = torch.from_numpy(sigma_np).float().cuda(gpu_device)
-                print(f'    Soft AKD: sigma loaded from {opt.sigma_path}')
+                else:
+                    if not os.path.exists(opt.sigma_path):
+                        raise FileNotFoundError(
+                            f"Class similarity matrix not found at {opt.sigma_path}. "
+                            f"Please run compute_class_similarity_matrix.py first."
+                        )
+                    if opt.sigma_path.endswith('.pt') or opt.sigma_path.endswith('.pth'):
+                        sigma = torch.load(opt.sigma_path, map_location='cpu').float().cuda(gpu_device)
+                    else:
+                        sigma_np = np.load(opt.sigma_path)
+                        sigma = torch.from_numpy(sigma_np).float().cuda(gpu_device)
+                    print(f'    Soft AKD: sigma loaded from {opt.sigma_path}')
+                assert sigma.shape[0] == n_cls, (
+                    f"Sigma shape {tuple(sigma.shape)} does not match num_classes={n_cls}."
+                )
                 print(f'    Soft AKD: lambda_soft = {opt.lambda_soft}')
-                print(f'    Soft AKD: sigma_temp = {opt.sigma_temp}')
+                if opt.sigma_temp is None:
+                    # Precompute teacher typicality for per-class dynamic α
+                    from distiller_zoo.SoftAKD import compute_row_typicality
+                    import torch.nn.functional as _F
+                    with torch.no_grad():
+                        _a_norm = _F.normalize(a_feat_t, p=2, dim=1)
+                        _a_sim  = (torch.mm(_a_norm, _a_norm.t()) + 1) / 2  # [C, C]
+                        typ_t_precomputed = compute_row_typicality(_a_sim, sigma)
+                    n_nan = torch.isnan(typ_t_precomputed).sum().item()
+                    print(f'    Soft AKD: teacher typicality precomputed ({n_nan} nan classes), dynamic α active')
+                else:
+                    print(f'    Soft AKD: sigma_temp={opt.sigma_temp} — typicality/α disabled, using static exponent')
             if opt.sigma_mode != 'student' and not getattr(opt, 'no_gcn', False):
                 gcn = GCN(num_classes=n_cls).cuda(gpu_device)
                 optimizer_gcn = torch.optim.Adam(gcn.parameters(), lr=opt.gcn_lr)
@@ -586,6 +623,11 @@ def main_worker(gpu, ngpus_per_node, opt):
             lock_std_delta=opt.lock_std_delta,
             save_folder=opt.save_folder,
         )
+    typ_logger = None
+    if opt.distill == 'soft_akd' and opt.sigma_temp is None:
+        from distiller_zoo.SoftAKD import TypicalityLogger
+        typ_logger = TypicalityLogger(opt.save_folder)
+
     gcn_loss_G_history = []
     gcn_loss_akd_history = []
     prev_dis_stats = {}   # tracks last epoch's d_std and dis_raw for delta logging
@@ -614,7 +656,9 @@ def main_worker(gpu, ngpus_per_node, opt):
                 gcn=gcn, optimizer_gcn=optimizer_gcn,
                 snapshot_store=gcn_snapshot_store,
                 scaler=dis_scaler,
-                dist_snapshot_store=dist_snapshot_store
+                dist_snapshot_store=dist_snapshot_store,
+                typicality_logger=typ_logger,
+                typ_t_precomputed=typ_t_precomputed,
             )
             if gcn is not None:
                 gcn_loss_G_history.append(epoch_loss_G)

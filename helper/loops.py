@@ -300,7 +300,9 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                       criterion_list, optimizer, optimizer_anchor, opt, a_feat_t,
                       sigma=None, anchor_labels=None,
                       gcn=None, optimizer_gcn=None, snapshot_store=None,
-                      scaler=None, dist_snapshot_store=None):
+                      scaler=None, dist_snapshot_store=None,
+                      typicality_logger=None,
+                      typ_t_precomputed=None):
     """One epoch of Anchor-based Knowledge Distillation (AKD / Soft AKD).
 
     AKD introduces learnable anchor images whose spatial attention is optimised
@@ -365,6 +367,7 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     n_cls = {
         'cifar100': 100,
         'imagenet': 1000,
+        'cifar100_oscr': 50,
     }.get(opt.dataset, 100)
 
     batch_time = AverageMeter()
@@ -404,12 +407,17 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
         feat_teacher = feat_t[-1]   # teacher pooled features
 
         # Layer-normalise logits (part of AKD methodology)
-        logit_s = F.layer_norm(logit_s, torch.Size((n_cls,)), None, None, 1e-7) * opt.ceta
-        logit_t = F.layer_norm(logit_t, torch.Size((n_cls,)), None, None, 1e-7) * opt.ceta
+        logit_s = F.layer_norm(logit_s, torch.Size((logit_s.size(1),)), None, None, 1e-7) * opt.ceta
+        logit_t = F.layer_norm(logit_t, torch.Size((logit_t.size(1),)), None, None, 1e-7) * opt.ceta
 
         # Losses
         loss_cls = criterion_cls(logit_s, labels)
-        loss_div = criterion_div(logit_s, logit_t)
+        if logit_s.size(1) != logit_t.size(1):
+            # Teacher/student have different output dims (e.g. OSCR: 100 vs 50).
+            # KL div is undefined; requires opt.div == 0.
+            loss_div = torch.tensor(0.0, device=logit_s.device)
+        else:
+            loss_div = criterion_div(logit_s, logit_t)
 
         loss_G = None
         is_student_mode = getattr(opt, 'sigma_mode', 'precomputed') == 'student'
@@ -425,14 +433,20 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_soft,
                                      opt.lambda_soft, opt, return_stats=collect_tb,
-                                     scaler=scaler)
+                                     scaler=scaler,
+                                     typicality_logger=typicality_logger,
+                                     batch_idx=idx, epoch=epoch,
+                                     typ_t_precomputed=typ_t_precomputed)
         elif use_soft:
             sigma_in = None if is_student_mode else sigma
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,
                                      labels, anchor_labels, sigma_in,
                                      opt.lambda_soft, opt, return_stats=collect_tb,
-                                     scaler=scaler)
+                                     scaler=scaler,
+                                     typicality_logger=typicality_logger,
+                                     batch_idx=idx, epoch=epoch,
+                                     typ_t_precomputed=typ_t_precomputed)
         else:
             loss_akd = akd_loss(feat_teacher.detach(), feat_student,
                                 a_feat_t.detach(), a_feat_s, opt)
@@ -536,6 +550,10 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
     if collect_dis and any(len(v) > 0 for v in dis_accum.values()):
         from distiller_zoo.SoftAKD2 import print_disagreement_stats
         print_disagreement_stats(dis_accum, epoch, opt, scaler=scaler)
+
+    # Typicality epoch summary
+    if typicality_logger is not None:
+        typicality_logger.end_epoch(epoch)
 
     # Build tensorboard stats dict (every epoch)
     dis_tb_stats = None
