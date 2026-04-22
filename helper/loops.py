@@ -425,7 +425,7 @@ def train_distill_akd(anchor_set, anchor_net, epoch, train_loader, module_list,
                 sigma, feat_teacher, feat_student,
                 a_feat_t, a_feat_s,
                 labels, anchor_labels, gcn, alpha=opt.alpha_soft,
-                sigma_s_mode=getattr(opt, 'sigma_s_mode', 'ab')
+                sigma_s_mode='bb'
             )
             loss_akd, dis_stats = soft_akd_loss(feat_teacher.detach(), feat_student,
                                      a_feat_t.detach(), a_feat_s,

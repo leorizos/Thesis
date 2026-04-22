@@ -141,50 +141,24 @@ class GCN(nn.Module):
 
 
 def soften_sigma_with_gcn(sigma, target_net, output_net, anchor_target, anchor_net,
-                          labels, anchor_labels, gcn, alpha=0.1, eps=1e-7,
-                          sigma_s_mode='ab'):
+                          labels, anchor_labels, gcn, alpha=0.1, eps=1e-7):
     """
     Adaptively soften precomputed sigma using a learnable GCN.
 
     Implements ASL-style dual optimization:
     1. Σ_t_hat = α * GCN(sigma) + (1-α) * sigma
-    2. loss_G = MSE(Σ_t_hat, Σ_s) where Σ_s = student's class-level patterns
-
-    sigma_s_mode controls how Σ_s is computed:
-        'ab' (default) — merged batch+anchor: sim(batch+anchor, batch+anchor) [B+A, B+A] → [C, C], 100% class coverage
-        'aa'           — anchor-to-anchor: sim(anchor_i, anchor_j)           [A, A] → [C, C]
-        'bb'           — batch-to-batch:   sim(batch_class_i, batch_class_j) [B, B] → [C, C]
+    2. loss_G = MSE(Σ_t_hat, Σ_s) where Σ_s = student batch-to-batch similarity [B, B] → [C, C]
     """
     num_classes = sigma.size(0)
     device = sigma.device
     C = num_classes
 
     output_net = F.normalize(output_net, p=2, dim=1)   # [B, D]
-    if anchor_net is not None:
-        anchor_net = F.normalize(anchor_net, p=2, dim=1)   # [A, D]
 
-    if sigma_s_mode == 'ab':
-        # Merged batch+anchor features [B+A, D], 100% class coverage
-        merged = torch.cat([output_net, anchor_net], dim=0)          # [B+A, D]
-        merged_labels = torch.cat([labels, anchor_labels], dim=0)    # [B+A]
-        sim = (torch.mm(merged, merged.t()) + 1) / 2                 # [B+A, B+A]
-        row_labels = merged_labels
-        col_labels = merged_labels
-
-    elif sigma_s_mode == 'aa':
-        # Similarity between anchors and anchors [A, A]
-        sim = (torch.mm(anchor_net, anchor_net.t()) + 1) / 2
-        row_labels = anchor_labels   # [A]
-        col_labels = anchor_labels   # [A]
-
-    elif sigma_s_mode == 'bb':
-        # Similarity between batch samples and batch samples [B, B]
-        sim = (torch.mm(output_net, output_net.t()) + 1) / 2
-        row_labels = labels          # [B]
-        col_labels = labels          # [B]
-
-    else:
-        raise ValueError(f"Unknown sigma_s_mode '{sigma_s_mode}'. Choose from 'ab', 'aa', 'bb'.")
+    # Batch-to-batch student similarity
+    sim = (torch.mm(output_net, output_net.t()) + 1) / 2
+    row_labels = labels   # [B]
+    col_labels = labels   # [B]
 
     # Aggregate to Σ_s [C, C] — vectorized with scatter_add_
     flat_idx = row_labels.unsqueeze(1) * C + col_labels.unsqueeze(0)  # [N_row, N_col]

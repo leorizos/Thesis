@@ -94,9 +94,8 @@ def parse_option():
     parser.add_argument('--alpha_soft', type=float, default=0.1, help='Soft AKD: GCN blending weight (0 = original sigma, 1 = full GCN)')
     parser.add_argument('--gcn_lr', type=float, default=1e-4, help='Soft AKD: learning rate for GCN')
     parser.add_argument('--no_gcn', action='store_true', help='Soft AKD: disable GCN softening (use raw sigma only)')
-    parser.add_argument('--sigma_s_mode', type=str, default='ab', choices=['ab', 'aa', 'bb'],
-                        help='Soft AKD: how to compute Sigma_s for GCN training. '
-                             'ab=batch-to-anchor (default), aa=anchor-to-anchor, bb=batch-to-batch')
+    parser.add_argument('--sigma_s_mode', type=str, default='bb', choices=['bb'],
+                        help='Soft AKD: how to compute Sigma_s for GCN training (bb=batch-to-batch)')
     parser.add_argument('--lambda_d0', type=lambda x: x if x == 'ma' else float(x), default=0.3,
                         help='Soft AKD adaptive lambda: sigmoid midpoint. Float (e.g. 0.3) uses static normalised d0; "ma" uses per-batch mean disagreement (default 0.3)')
     parser.add_argument('--scaler_update_freq', type=str, default='epoch', choices=['epoch', 'batch'],
@@ -177,8 +176,7 @@ def parse_option():
             opt.model_name += '_sigstu'
         if opt.sigma_temp != 1.0 and opt.sigma_mode != 'student':
             opt.model_name += '_t_{}'.format(opt.sigma_temp)
-        if opt.sigma_s_mode != 'ab':
-            opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
+        opt.model_name += '_sm_{}'.format(opt.sigma_s_mode)
         if opt.lambda_d0 != 0.3 and opt.lambda_d0 != 'ma':
             opt.model_name += '_ld_{}'.format(opt.lambda_d0)
         if opt.scaler_update_freq == 'batch':
